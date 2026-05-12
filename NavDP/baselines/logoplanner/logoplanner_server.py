@@ -14,6 +14,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--port",type=int,default=8888)
 parser.add_argument("--checkpoint",type=str,default="./logoplanner_policy.ckpt")
+parser.add_argument("--temporal_depth",type=int,default=8)
 args = parser.parse_known_args()[0]
 
 app = Flask(__name__)
@@ -31,7 +32,7 @@ def logoplanner_reset():
                                             image_size=224,
                                             memory_size=8,
                                             predict_size=24,
-                                            temporal_depth=16,
+                                            temporal_depth=args.temporal_depth,
                                             heads=8,
                                             token_dim=384,
                                             navi_model=args.checkpoint,

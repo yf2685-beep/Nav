@@ -108,7 +108,6 @@ class GeometryModel(Pi3):
         return scene_token
     
     def forward(self, imgs, depths):
-        import pdb; pdb.set_trace()
         B, N, H, W, _ = imgs.shape
         assert N == self.context_size
         patch_h, patch_w = H // 14, W // 14
@@ -127,18 +126,19 @@ class GeometryModel(Pi3):
         world_point_hidden = self.world_point_decoder(world_point_hidden, xpos=pos)[:, self.patch_start_idx:] # (B*T, 269, 1024)
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            # local points
-            ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+            # local points (cast bf16 -> fp32 since autocast is disabled here)
+            point_hidden_f = point_hidden.float()
+            ret = self.point_head([point_hidden_f[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
             xy, z = ret.split([2, 1], dim=-1)
             z = torch.exp(z)
             local_points = torch.cat([xy * z, z], dim=-1).contiguous()
-            
+
             # camera
             camera_hidden = camera_hidden[:, self.patch_start_idx:].float() # (B*T, 269, 512)
             camera_poses = self.camera_head.forward_pose(camera_hidden, patch_h, patch_w).reshape(B, N, 5).contiguous()
-            
+
             # world points: unproject local points using camera poses or direct prediction
-            world_points = self.world_point_head([world_point_hidden], (H, W)).reshape(B, N, H, W, -1)
+            world_points = self.world_point_head([world_point_hidden.float()], (H, W)).reshape(B, N, H, W, -1)
             world_points = torch.sign(world_points) * (torch.expm1(torch.abs(world_points))).contiguous()
         
         state_token = self.forward_state(camera_hidden, B, N) # (B, N, D)

@@ -24,7 +24,19 @@ class LoGoPlanner_Agent:
         self.memory_size = memory_size
         self.context_size = context_size
         self.navi_former = LoGoPlanner_Policy(image_size,memory_size,context_size,predict_size,temporal_depth,heads,token_dim,device)
-        self.navi_former.load_state_dict(torch.load(navi_model,map_location=self.device),strict=False)
+        # Trainer wraps the policy network in LoGoPlanner_Net (a `.policy` attribute),
+        # so saved checkpoints have keys prefixed with `policy.`. Strip the prefix
+        # before loading; otherwise strict=False silently drops every key and the
+        # network keeps its random init.
+        raw_sd = torch.load(navi_model, map_location=self.device, weights_only=False)
+        if isinstance(raw_sd, dict) and 'state_dict' in raw_sd:
+            raw_sd = raw_sd['state_dict']
+        if any(k.startswith('policy.') for k in raw_sd.keys()):
+            raw_sd = {k[len('policy.'):]: v for k, v in raw_sd.items() if k.startswith('policy.')}
+        load_res = self.navi_former.load_state_dict(raw_sd, strict=False)
+        print(f"[LoGoPlanner] ckpt load: missing={len(load_res.missing_keys)}, unexpected={len(load_res.unexpected_keys)}")
+        if len(load_res.missing_keys) > 0:
+            print(f"[LoGoPlanner] WARNING first missing: {load_res.missing_keys[:3]}")
         self.navi_former.to(self.device)
         self.navi_former.eval()
         self.target_H, self.target_W = 168, 308

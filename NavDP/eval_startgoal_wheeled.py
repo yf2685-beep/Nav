@@ -121,10 +121,12 @@ def planning_thread(env, camera_intrinsic):
             
             # Print planning timing
             planning_time = time.time() - planning_start
-            print(f"Planning time: {planning_time:.3f}s, Goal: [{float(goal[0]):.2f}, {float(goal[1]):.2f}, {float(goal[2]):.2f}]")
+            print(f"Planning time: {planning_time:.3f}s, Goal shape: {goal.shape}, first goal: {goal[0].tolist()}")
                 
         except Exception as e:
+            import traceback
             print(f"Planning error: {e}")
+            traceback.print_exc()
             with output_lock:
                 planning_output.is_planning = False
                 planning_output.planning_error = str(e)
@@ -197,9 +199,10 @@ while simulation_app.is_running():
         camera_rot = R.from_quat(camera_rot_quat).as_matrix()
         
         with input_lock:
-            if planning_input.current_goal is None:
-                start_goals = goals.copy()
-            planning_input.current_goal = start_goals.copy()
+            # goal_pose is in the robot's CURRENT frame (recomputed every step
+            # by oracle_imu_pose_data in wheeled_task.py). Must be refreshed
+            # each step — sending a frozen start-frame goal is what caused SR=0%.
+            planning_input.current_goal = goals.copy()
             planning_input.current_image = images.copy()
             planning_input.current_depth = depths.copy()
             planning_input.camera_pos = camera_pos.copy()

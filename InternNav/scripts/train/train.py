@@ -33,6 +33,8 @@ from scripts.train.configs import (
     seq2seq_plus_exp_cfg,
     navdp_exp_cfg,
     logoplanner_exp_cfg,
+    logoplanner_stage1_exp_cfg,
+    logoplanner_stage2_exp_cfg,
 )
 import sys
 from datetime import datetime
@@ -57,6 +59,8 @@ class TrainCfg(BaseModel):
     dataset_navdp: Optional[str] = None
     ckpt_to_load: Optional[str] = None
     load_from_ckpt: Optional[bool] = None
+    bf16: Optional[bool] = None
+    gradient_accumulation_steps: Optional[int] = None
 
     # exp-level overrides
     torch_gpu_ids: Optional[list[int]] = None
@@ -68,6 +72,7 @@ def _apply_overrides(exp_cfg, cli: 'TrainCfg') -> None:
     il_fields = {
         'batch_size', 'num_workers', 'epochs', 'lr',
         'root_dir', 'dataset_navdp', 'ckpt_to_load', 'load_from_ckpt',
+        'bf16', 'gradient_accumulation_steps',
     }
     exp_fields = {'torch_gpu_ids', 'seed'}
     for field in il_fields:
@@ -134,7 +139,7 @@ def main(config, model_class, model_config_class):
         print(f"  MASTER_ADDR: {os.getenv('MASTER_ADDR', 'Not set')}")
         print(f"  MASTER_PORT: {os.getenv('MASTER_PORT', 'Not set')}")
 
-        if config.model_name in ("navdp", "logoplanner"):
+        if config.model_name in ("navdp", "logoplanner", "logoplanner_stage1", "logoplanner_stage2"):
             local_rank = int(os.getenv('LOCAL_RANK', '0'))
             world_size = int(os.getenv('WORLD_SIZE', '1'))
             rank = int(os.getenv('RANK', '0'))
@@ -175,7 +180,7 @@ def main(config, model_class, model_config_class):
         if config.il.ckpt_to_load:
             print(f"load model from:{config.il.ckpt_to_load}")
         model = model_class.from_pretrained(pretrained_model_name_or_path=config.il.ckpt_to_load, config=model_cfg)
-        if config.model_name in ("navdp", "logoplanner"):
+        if config.model_name in ("navdp", "logoplanner", "logoplanner_stage1", "logoplanner_stage2"):
             model.to(device)
             # Check that all parameters and buffers are on the correct device
             for name, param in model.named_parameters():
@@ -210,7 +215,7 @@ def main(config, model_class, model_config_class):
         transformers_logger = logging.getLogger("transformers")
         if transformers_logger.hasHandlers():
             transformers_logger.handlers = []
-        if config.model_name in ("navdp", "logoplanner") and local_rank in [0, -1]:  # Only main process or non-distributed
+        if config.model_name in ("navdp", "logoplanner", "logoplanner_stage1", "logoplanner_stage2") and local_rank in [0, -1]:  # Only main process or non-distributed
             transformers_logger.addHandler(train_logger.handlers[0])
         transformers_logger.setLevel(logging.INFO)
 
@@ -227,7 +232,7 @@ def main(config, model_class, model_config_class):
                                     preload = config.il.preload,
                                     random_digit = config.il.random_digit,
                                     prior_sample = config.il.prior_sample)
-        elif config.model_name == "logoplanner":
+        elif config.model_name in ("logoplanner", "logoplanner_stage1", "logoplanner_stage2"):
             train_dataset_data = LoGoPlanner_Dataset(
                 config.il.root_dir,
                 preload_path=config.il.dataset_navdp,
@@ -291,16 +296,18 @@ def main(config, model_class, model_config_class):
             collate_fn = logoplanner_collate_fn
 
         # ------------ training args ------------
+        bf16_enabled = bool(getattr(config.il, 'bf16', False))
+        grad_accum_steps = int(getattr(config.il, 'gradient_accumulation_steps', 1) or 1)
         training_args = TrainingArguments(
             output_dir=config.output_dir,
             run_name=config.name,
             remove_unused_columns=False,
             deepspeed='',
             gradient_checkpointing=False,
-            bf16=False,#fp16=False,
+            bf16=bf16_enabled,
             tf32=False,
             per_device_train_batch_size=config.il.batch_size,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=grad_accum_steps,
             dataloader_num_workers=config.il.num_workers,
             dataloader_pin_memory=False,
             optim='adamw_torch',
@@ -370,6 +377,8 @@ if __name__ == '__main__':
         'rdp': [rdp_exp_cfg, RDPNet, RDPModelConfig],
         'navdp': [navdp_exp_cfg, NavDPNet, NavDPModelConfig],
         'logoplanner': [logoplanner_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
+        'logoplanner_stage1': [logoplanner_stage1_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
+        'logoplanner_stage2': [logoplanner_stage2_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
     }
 
     if config.model_name not in supported_cfg:

@@ -117,6 +117,51 @@ class LoGoPlannerNet(PreTrainedModel):
             device=self._device,
         )
 
+        # Apply paper-style two-stage freezing if `loss.stage` is set.
+        #   stage 1: freeze the geometry ViT-L encoder (Pi3 dinov2_vitl14_reg);
+        #            geometry decoder + all task-specific heads stay trainable.
+        #   stage 2: also freeze the geometry decoder + register_token; only
+        #            task-specific heads + the diffusion-policy decoder train.
+        loss_cfg = il.get('loss') or {}
+        stage = loss_cfg.get('stage', 0) if isinstance(loss_cfg, dict) else getattr(loss_cfg, 'stage', 0)
+        self._apply_stage_freeze(int(stage or 0))
+
+    def _apply_stage_freeze(self, stage: int):
+        """Freeze parameters according to LoGoPlanner paper's training stage.
+
+        See paper §V.A. stage=0 is the single-stage baseline (no freezing).
+        """
+        if stage == 0:
+            print('[stage-freeze] stage=0 (single-stage), no freezing applied')
+            return
+        if stage not in (1, 2):
+            raise ValueError(f'unsupported stage {stage}')
+
+        ge = self.policy.state_encoder  # GeometryModel
+
+        frozen_count = 0
+        if stage >= 1:
+            for p in ge.encoder.parameters():
+                p.requires_grad = False
+                frozen_count += p.numel()
+
+        if stage >= 2:
+            for p in ge.decoder.parameters():
+                p.requires_grad = False
+                frozen_count += p.numel()
+            # Pi3 register_token sits beside the decoder; freeze together.
+            ge.register_token.requires_grad = False
+            frozen_count += ge.register_token.numel()
+
+        all_count = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(
+            f'[stage-freeze] stage={stage}: '
+            f'frozen {frozen_count/1e6:.1f}M params, '
+            f'trainable {trainable/1e6:.1f}M / {all_count/1e6:.1f}M total '
+            f'({100*trainable/all_count:.1f}%)'
+        )
+
     # Keep ``policy.device`` / tgt_mask / cond_critic_mask consistent with HF's
     # .to() — ``LoGoPlanner_Policy`` stores .device as a plain attribute.
     def to(self, device, *args, **kwargs):
@@ -162,7 +207,6 @@ class LoGoPlannerNet(PreTrainedModel):
         batch_labels,
         batch_augments,
     ):
-        import pdb; pdb.set_trace()
         p = self.policy
         device = next(self.parameters()).device
 
