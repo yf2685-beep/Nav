@@ -61,10 +61,32 @@ class TrainCfg(BaseModel):
     load_from_ckpt: Optional[bool] = None
     bf16: Optional[bool] = None
     gradient_accumulation_steps: Optional[int] = None
+    report_to: Optional[str] = None  # 'tensorboard' (default) | 'wandb' | 'none'
+    max_steps: Optional[int] = None  # cap optimizer steps; overrides epochs when > 0
+
+    # loss-weight overrides (lambda_*) -> il.loss.w_*. Leave unset to keep the
+    # values from the per-stage config (i.e. original training behavior).
+    lambda_diffusion: Optional[float] = None
+    lambda_critic: Optional[float] = None
+    lambda_pose: Optional[float] = None
+    lambda_local: Optional[float] = None
+    lambda_world: Optional[float] = None
+    lambda_subgoal: Optional[float] = None
 
     # exp-level overrides
     torch_gpu_ids: Optional[list[int]] = None
     seed: Optional[int] = None
+
+
+# CLI lambda_* field -> il.loss.w_* attribute
+_LOSS_WEIGHT_MAP = {
+    'lambda_diffusion': 'w_diffusion',
+    'lambda_critic': 'w_critic',
+    'lambda_pose': 'w_pose',
+    'lambda_local': 'w_local',
+    'lambda_world': 'w_world',
+    'lambda_subgoal': 'w_subgoal',
+}
 
 
 def _apply_overrides(exp_cfg, cli: 'TrainCfg') -> None:
@@ -72,7 +94,7 @@ def _apply_overrides(exp_cfg, cli: 'TrainCfg') -> None:
     il_fields = {
         'batch_size', 'num_workers', 'epochs', 'lr',
         'root_dir', 'dataset_navdp', 'ckpt_to_load', 'load_from_ckpt',
-        'bf16', 'gradient_accumulation_steps',
+        'bf16', 'gradient_accumulation_steps', 'report_to', 'max_steps',
     }
     exp_fields = {'torch_gpu_ids', 'seed'}
     for field in il_fields:
@@ -85,6 +107,25 @@ def _apply_overrides(exp_cfg, cli: 'TrainCfg') -> None:
         if val is not None:
             setattr(exp_cfg, field, val)
             print(f'[override] {field} = {val}')
+    # loss weights -> exp_cfg.il.loss.w_*
+    for cli_field, cfg_field in _LOSS_WEIGHT_MAP.items():
+        val = getattr(cli, cli_field)
+        if val is not None:
+            setattr(exp_cfg.il.loss, cfg_field, val)
+            print(f'[override] il.loss.{cfg_field} = {val}')
+
+
+def _loss_weight_tag(loss_cfg) -> str:
+    """Compact, wandb-friendly tag describing the active loss weights, e.g.
+    loss_dif1.0_cri1.0_pos1.0_loc0.5_wor0.5_sub0.1 — used in the wandb run name
+    so runs are visually separable by their loss-weight recipe."""
+    def g(name, default):
+        return getattr(loss_cfg, name, default)
+    return (
+        f"loss_dif{g('w_diffusion',1.0)}_cri{g('w_critic',1.0)}"
+        f"_pos{g('w_pose',1.0)}_loc{g('w_local',0.5)}"
+        f"_wor{g('w_world',0.5)}_sub{g('w_subgoal',0.1)}"
+    )
 
 
 class CheckpointFormatCallback(TrainerCallback):
@@ -298,9 +339,15 @@ def main(config, model_class, model_config_class):
         # ------------ training args ------------
         bf16_enabled = bool(getattr(config.il, 'bf16', False))
         grad_accum_steps = int(getattr(config.il, 'gradient_accumulation_steps', 1) or 1)
+        # wandb run name carries the loss-weight recipe so runs are separable.
+        # output_dir still uses config.name, so checkpoints are unaffected.
+        if config.model_name in ('logoplanner', 'logoplanner_stage1', 'logoplanner_stage2'):
+            wandb_run_name = f'{config.name}_{_loss_weight_tag(config.il.loss)}'
+        else:
+            wandb_run_name = config.name
         training_args = TrainingArguments(
             output_dir=config.output_dir,
-            run_name=config.name,
+            run_name=wandb_run_name,
             remove_unused_columns=False,
             deepspeed='',
             gradient_checkpointing=False,
@@ -315,6 +362,7 @@ def main(config, model_class, model_config_class):
             lr_scheduler_type='cosine',
             logging_steps=10.0,
             num_train_epochs=config.il.epochs,
+            max_steps=int(getattr(config.il, 'max_steps', -1) or -1),
             save_strategy='epoch',# no
             save_steps=config.il.save_interval_epochs,
             save_total_limit=8,

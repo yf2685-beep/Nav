@@ -18,6 +18,10 @@ parser.add_argument(
     "--speed", type=float, default=0.5)
 parser.add_argument(
     "--port", type=int, default=19999)
+parser.add_argument(
+    "--per_step_goal", action="store_true",
+    help="refresh goal each planning step. Default is frozen (matches paper/HF release). "
+         "Enable only for ckpts trained with per-step goal supervision.")
 args_cli = parser.parse_args()
 app_launcher = AppLauncher(headless=True, enable_cameras=True)
 simulation_app = app_launcher.app
@@ -199,10 +203,16 @@ while simulation_app.is_running():
         camera_rot = R.from_quat(camera_rot_quat).as_matrix()
         
         with input_lock:
-            # goal_pose is in the robot's CURRENT frame (recomputed every step
-            # by oracle_imu_pose_data in wheeled_task.py). Must be refreshed
-            # each step — sending a frozen start-frame goal is what caused SR=0%.
-            planning_input.current_goal = goals.copy()
+            # Default (paper / HF release): freeze the goal at episode start so the
+            # planner sees the same start-frame goal vector for the whole episode.
+            # With --per_step_goal, refresh each step using the current robot-frame
+            # goal_pose (recomputed by oracle_imu_pose_data in wheeled_task.py).
+            if args_cli.per_step_goal:
+                planning_input.current_goal = goals.copy()
+            else:
+                if planning_input.current_goal is None:
+                    start_goals = goals.copy()
+                planning_input.current_goal = start_goals.copy()
             planning_input.current_image = images.copy()
             planning_input.current_depth = depths.copy()
             planning_input.camera_pos = camera_pos.copy()

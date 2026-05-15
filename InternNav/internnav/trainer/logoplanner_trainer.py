@@ -56,6 +56,49 @@ class LoGoPlannerTrainer(BaseTrainer):
         rank = dist.get_rank() if dist.is_initialized() else 0
         print(f"[Rank {rank}] Model device: {self.model_device}")
 
+        # Per-component loss bookkeeping for wandb/tensorboard. compute_loss runs
+        # every micro-step; log() fires every logging_steps. We sum here and emit
+        # the window-average in log() so each logged point is representative.
+        self._loss_comp_sums: dict[str, float] = {}
+        self._loss_comp_count: int = 0
+        self._wandb_cfg_logged: bool = False
+
+    def _accumulate_loss_components(self, comp: dict):
+        """Add this micro-step's component values into the running window sum."""
+        for k, v in comp.items():
+            val = v.item() if hasattr(v, 'item') else float(v)
+            self._loss_comp_sums[k] = self._loss_comp_sums.get(k, 0.0) + val
+        self._loss_comp_count += 1
+
+    def _maybe_log_lambdas_to_wandb(self):
+        """One-time push of the active lambda weights into wandb.config so each
+        run is self-describing. No-op if wandb isn't the active reporter."""
+        if self._wandb_cfg_logged:
+            return
+        self._wandb_cfg_logged = True
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.config.update(
+                    {f'lambda_{k}': v for k, v in self._loss_weights().items()},
+                    allow_val_change=True,
+                )
+        except Exception:
+            pass
+
+    def log(self, logs, *args, **kwargs):
+        """Inject window-averaged per-component losses alongside the metrics
+        the HF Trainer already emits (train/total loss, learning_rate, grad_norm).
+        Everything in `logs` is dispatched to whatever report_to backends are
+        active (wandb / tensorboard)."""
+        if self._loss_comp_count > 0:
+            for k, total in self._loss_comp_sums.items():
+                logs[k] = total / self._loss_comp_count
+            self._loss_comp_sums = {}
+            self._loss_comp_count = 0
+        self._maybe_log_lambdas_to_wandb()
+        return super().log(logs, *args, **kwargs)
+
     def _loss_weights(self):
         w = self.config.il.loss
         return {
@@ -128,6 +171,29 @@ class LoGoPlannerTrainer(BaseTrainer):
             'world_loss': world_loss,
             'subgoal_loss': subgoal_loss,
         }
+
+        # --- per-component metrics for wandb/tensorboard ---
+        # raw      = unweighted loss term (use this to judge whether a head is
+        #            actually learning, independent of its lambda).
+        # weighted = lambda * raw, i.e. the term's real contribution to total.
+        # Compare raw curves across runs; weighted curves explain total_loss.
+        # Guarded on model.training so eval batches never pollute train/ metrics.
+        if getattr(model, 'training', True):
+            self._accumulate_loss_components({
+                'train/total_loss':              loss,
+                'train/loss_diffusion_raw':      action_loss,
+                'train/loss_critic_raw':         critic_loss,
+                'train/loss_pose_raw':           pose_loss,
+                'train/loss_local_raw':          local_loss,
+                'train/loss_world_raw':          world_loss,
+                'train/loss_subgoal_raw':        subgoal_loss,
+                'train/loss_diffusion_weighted': w['diffusion'] * action_loss,
+                'train/loss_critic_weighted':    w['critic'] * critic_loss,
+                'train/loss_pose_weighted':      w['pose'] * pose_loss,
+                'train/loss_local_weighted':     w['local'] * local_loss,
+                'train/loss_world_weighted':     w['world'] * world_loss,
+                'train/loss_subgoal_weighted':   w['subgoal'] * subgoal_loss,
+            })
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):
