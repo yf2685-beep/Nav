@@ -133,6 +133,33 @@ This is the only loss change that measurably improved SR on mini data
 (+4 SR points, SPL +0.07). With n=100 the SR delta is near the noise floor
 (±~5%), but the SPL gain is more robust; multi-scene evaluation would harden it.
 
+## Artifacts & Paths
+
+Checkpoints and eval results are large and machine-local (not committed to git).
+Locations (machine-specific):
+
+### Checkpoints
+| What | Machine | Path |
+|---|---|---|
+| Warm-start (Pi3 + DA-S injected) | 131 | `/media/cvpr/yuxuan/logoplanner/checkpoints/logoplanner_warmstart/` |
+| Training runs (loss-weight / nogoal / Stage-1) | 131 | `/media/cvpr/yuxuan/logoplanner/Nav/InternNav/checkpoints/<run>/ckpts/checkpoint-*logoplanner.ckpt` |
+| Eval copies (critic_lo / nogoal_off / nogoal_cri03) | 186 | `/home/nyuair/data-eval/checkpoints_lw/` |
+| Official HF checkpoint | 186 | `/home/nyuair/data-eval/checkpoints_hf/logoplanner_policy.ckpt` |
+
+`<run>` ∈ `logo_lw_{baseline,critic_lo,critic_hi,critic_off,cri0.1..cri0.6,subgoal_hi,diffusion_hi}`,
+`logo_nogoal_off`, `logo_nogoal_off_cri0.3`, `logo_s1long`.
+
+### Eval results
+| What | Machine | Path |
+|---|---|---|
+| **nogoal_off SR=23%** (metric.csv + eval log) | 186 | `/home/nyuair/data-eval/eval_results_backup/nogoal_off_scene0_*` |
+| nogoal_off metric.csv (mirror) | 127 | `1 robot navigation/eval_results/nogoal_off_scene0_metric.csv` |
+| 20-scene paper eval (per-scene, archived live) | 186 | `/home/nyuair/data-eval/eval_results_backup/20scene/` |
+
+`metric.csv` columns: `success, spl, ne, le, distance` — one row per episode.
+Eval runs archive each scene's `metric.csv` into `eval_results_backup/` the moment
+it finishes, so results are never lost to an output-dir overwrite.
+
 ## Reproducing
 
 ```bash
