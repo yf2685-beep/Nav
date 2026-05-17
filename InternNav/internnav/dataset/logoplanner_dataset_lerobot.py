@@ -66,6 +66,7 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
         context_image_width=308,
         depth_max=5.0,
         depth_min=0.1,
+        critic_goal_weight=0.0,
     ):
         super().__init__(
             root_dirs,
@@ -86,6 +87,11 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
         self.context_image_width = context_image_width
         self.depth_max = depth_max
         self.depth_min = depth_min
+        # >0 enables a goal-aware critic GT term (direction 3): the critic value
+        # is additionally penalised by how far the trajectory's endpoint lands
+        # from the goal, so the critic ranks goal-reaching — not just obstacle
+        # avoidance. 0.0 keeps the original obstacle-only critic GT.
+        self.critic_goal_weight = critic_goal_weight
 
     # ---- Context image/depth loading (aspect-preserving, not squared) ----
 
@@ -343,6 +349,16 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             augment_critic = 2.0
 
         point_goal = target_xyt_actions[-1]
+
+        # direction-3: goal-aware critic GT. Penalise each trajectory's critic
+        # value by how far its endpoint lands from the goal, so the critic
+        # learns to rank goal-reaching (not only obstacle avoidance).
+        if self.critic_goal_weight > 0:
+            goal_xy = point_goal[0:2]
+            pred_goal_dist = np.linalg.norm(target_xyt_actions[action_indexes][-1][0:2] - goal_xy)
+            augment_goal_dist = np.linalg.norm(augment_xyt_actions[action_indexes][-1][0:2] - goal_xy)
+            pred_critic = pred_critic - self.critic_goal_weight * float(pred_goal_dist)
+            augment_critic = augment_critic - self.critic_goal_weight * float(augment_goal_dist)
 
         # --- geometry GT (new) ---
         # Use context_indices clipped into valid range; invalid slots already masked.

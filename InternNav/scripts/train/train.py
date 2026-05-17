@@ -63,6 +63,8 @@ class TrainCfg(BaseModel):
     gradient_accumulation_steps: Optional[int] = None
     report_to: Optional[str] = None  # 'tensorboard' (default) | 'wandb' | 'none'
     max_steps: Optional[int] = None  # cap optimizer steps; overrides epochs when > 0
+    critic_goal_weight: Optional[float] = None  # >0 = goal-aware critic GT (dir 3)
+    skip_nogoal: Optional[bool] = None  # skip the no-goal diffusion forward (dir 2)
 
     # loss-weight overrides (lambda_*) -> il.loss.w_*. Leave unset to keep the
     # values from the per-stage config (i.e. original training behavior).
@@ -72,6 +74,8 @@ class TrainCfg(BaseModel):
     lambda_local: Optional[float] = None
     lambda_world: Optional[float] = None
     lambda_subgoal: Optional[float] = None
+    lambda_nogoal: Optional[float] = None    # no-goal diffusion term (default 0.5)
+    lambda_maingoal: Optional[float] = None  # goal-conditioned diffusion term (default 0.5)
 
     # exp-level overrides
     torch_gpu_ids: Optional[list[int]] = None
@@ -86,6 +90,8 @@ _LOSS_WEIGHT_MAP = {
     'lambda_local': 'w_local',
     'lambda_world': 'w_world',
     'lambda_subgoal': 'w_subgoal',
+    'lambda_nogoal': 'w_nogoal',
+    'lambda_maingoal': 'w_maingoal',
 }
 
 
@@ -95,6 +101,7 @@ def _apply_overrides(exp_cfg, cli: 'TrainCfg') -> None:
         'batch_size', 'num_workers', 'epochs', 'lr',
         'root_dir', 'dataset_navdp', 'ckpt_to_load', 'load_from_ckpt',
         'bf16', 'gradient_accumulation_steps', 'report_to', 'max_steps',
+        'critic_goal_weight', 'skip_nogoal',
     }
     exp_fields = {'torch_gpu_ids', 'seed'}
     for field in il_fields:
@@ -290,6 +297,7 @@ def main(config, model_class, model_config_class):
                 context_image_width=config.il.context_image_width,
                 depth_max=config.il.depth_max,
                 depth_min=config.il.depth_min,
+                critic_goal_weight=getattr(config.il, 'critic_goal_weight', 0.0),
             )
         else:
             if '3dgs' in config.il.lmdb_features_dir or '3dgs' in config.il.lmdb_features_dir:
