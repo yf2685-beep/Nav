@@ -9,15 +9,18 @@ trajectory head.
 
 | Setting | Checkpoint | Eval | SR | SPL |
 |---|---|---|---|---|
-| **Our reproduction** | Stage-2 mini, step 849 | scene 0, 100 ep | **19%** | ~0.16 |
+| Our reproduction (baseline) | Stage-2 mini, step 849 | scene 0, 100 ep | 19% | ~0.16 |
+| **Best mini-data config** | Stage-2 mini, **no-goal term removed** | scene 0, 100 ep | **23%** | **0.227** |
 | Pipeline sanity check | official HF ckpt | scene 0, 100 ep | 60% | 0.59 |
 | Paper (Table I) | official | 20 home scenes | 57.3% | 52.4% |
 
 **Our trained checkpoint reaches SR = 19% on InternScenes home scene 0**
 (100 episodes, PointGoal). This is a *trend-level* reproduction: the model
-performs genuine goal-directed navigation (11/19 successful episodes at
+performs genuine goal-directed navigation (most successful episodes at
 SPL = 1.0, i.e. optimal paths), but absolute SR is far below the paper because
 the model was trained on ~0.04% of the paper's data/compute budget — see below.
+A loss-function change (dropping the no-goal diffusion term) lifts SR to **23%**
+— see *Loss-Weight Experiments*.
 
 ## Method
 
@@ -87,6 +90,49 @@ original eval code yields **SR = 60%** on scene 0 (100 episodes) — consistent
 with the paper's 57.3% 20-scene average. This confirms the evaluation pipeline
 is correct and the 19% is purely a function of our limited training budget.
 
+## Loss-Weight Experiments
+
+To probe whether SR can be improved purely by re-balancing the training loss
+(no model/data/pipeline change), the trainer exposes per-component weights via
+`--lambda-*` flags and logs per-component raw/weighted losses + grad-norm to
+Weights & Biases. All runs below: mini data, Stage-2 config, 3000 steps,
+warm-start init — differing only in loss weights.
+
+### Critic weight sweep (`w_critic`: 0.0 → 2.0)
+The Stage-2 total loss is `w_diffusion·action + w_critic·critic + w_subgoal·subgoal`.
+Sweeping `w_critic` (baseline = 1.0) gives a clean dose-response in training
+stability — grad-norm median rises monotonically with the critic weight:
+
+| `w_critic` | 0.0 | 0.1 | 0.3 | 1.0 | 2.0 |
+|---|---|---|---|---|---|
+| grad-norm (median) | 2 | 5 | 13 | 45 | 102 |
+| diffusion raw loss | 0.07 | 0.07 | 0.09 | 0.16 | 0.35 |
+
+A large critic weight destabilises training and competes with the diffusion
+head for capacity. **But this did not move SR**: `w_critic=0.3` (the most stable
+config) evaluated at SR 18% ≈ baseline 19%. On mini data, SR is limited by data
+diversity (single scene group), not by loss-weight tuning.
+
+### No-goal term removal — the change that helped
+The action loss is `0.5·ng + 0.5·mg`, mixing a **no-goal** (exploration)
+diffusion term and a **main-goal** (goal-conditioned) term. PointGoal evaluation
+only needs goal-conditioned behaviour, so we set `w_nogoal=0, w_maingoal=1.0`
+(via `--lambda-nogoal/--lambda-maingoal`) — putting all diffusion capacity into
+goal-conditioned trajectory generation.
+
+| Config | SR | SPL |
+|---|---|---|
+| baseline (`0.5·ng + 0.5·mg`) | 19% | ~0.16 |
+| **no-goal removed (`1.0·mg`)** | **23%** | **0.227** |
+
+SR by start distance (no-goal-removed run): ≤4.5 m 38%, 4.5–6 m 17%, 6–8 m 26%,
+≥8 m 8% — long-range navigation remains the weak point. 21 of 23 successful
+episodes are at SPL = 1.0 (optimal path).
+
+This is the only loss change that measurably improved SR on mini data
+(+4 SR points, SPL +0.07). With n=100 the SR delta is near the noise floor
+(±~5%), but the SPL gain is more robust; multi-scene evaluation would harden it.
+
 ## Reproducing
 
 ```bash
@@ -104,6 +150,8 @@ python InternNav/scripts/train/train.py --model-name logoplanner_stage2 \
 # 4. evaluate (see Evaluation section)
 ```
 
-Loss weights are configurable via `--lambda-{diffusion,critic,pose,local,world,subgoal}`;
+Loss weights are configurable via
+`--lambda-{diffusion,critic,pose,local,world,subgoal,nogoal,maingoal}`;
 `--report-to wandb` enables Weights & Biases logging of per-component raw and
-weighted losses, grad-norm and learning rate.
+weighted losses, grad-norm and learning rate. The best mini-data result so far
+uses `--lambda-nogoal 0.0 --lambda-maingoal 1.0` (see *Loss-Weight Experiments*).
