@@ -73,7 +73,7 @@ class GeometryModel_LingBot(nn.Module):
         use_sdpa=True,               # SDPA backend = no FlashInfer dependency
     )
 
-    def __init__(self, context_size=12, device='cuda:0', **kwargs):
+    def __init__(self, context_size=12, device='cuda:0', pretrained_ckpt=None, **kwargs):
         super().__init__()
         self.context_size = context_size
         self.device = device
@@ -84,6 +84,17 @@ class GeometryModel_LingBot(nn.Module):
         self.embed_dim = cfg['embed_dim']                          # 1024
         self.patch_start_idx = self.aggregator.patch_start_idx     # 6 for default
         self.patch_size = cfg['patch_size']                        # 14
+
+        # 1b. Optionally load LingBot-Map pretrained weights into the aggregator.
+        # Falls back to LINGBOT_CKPT env var so callers in policy_network.py /
+        # the trainer don't have to thread the path through every constructor.
+        if pretrained_ckpt is None:
+            pretrained_ckpt = os.environ.get('LINGBOT_CKPT')
+        if pretrained_ckpt and os.path.exists(pretrained_ckpt):
+            self._load_lingbot_ckpt(pretrained_ckpt)
+        else:
+            if pretrained_ckpt:
+                print(f"[lingbot-v2] WARNING: LINGBOT_CKPT not found at {pretrained_ckpt}")
 
         # 2. DepthAnythingV2-S for metric scale prior (kept from LoGoPlanner)
         model_configs = {'vits': {'encoder': 'vits', 'features': 64,
@@ -120,6 +131,62 @@ class GeometryModel_LingBot(nn.Module):
         self.scene_layer = nn.Linear(self.embed_dim, 384)
         self.scene_compressor = TokenCompressor(embed_dim=384, num_heads=8,
                                                 target_length=1)
+
+    # ----- pretrained-checkpoint loader ------------------------------------
+    def _load_lingbot_ckpt(self, path):
+        """Load the public LingBot-Map checkpoint into the AggregatorStream.
+
+        Handles a few common save formats (state_dict at top level, or wrapped
+        in {'state_dict': ...} / {'model': ...}) and tolerates leftover prefixes
+        ('module.' from DDP, 'aggregator.' if saved alongside heads).
+        Uses strict=False because the released checkpoint also contains heads
+        we don't reuse (we plug in our own Pi3-style supervision heads).
+        """
+        print(f"[lingbot-v2] loading pretrained ckpt: {path}")
+        raw = torch.load(path, map_location='cpu', weights_only=False)
+        if isinstance(raw, dict):
+            for k in ('state_dict', 'model'):
+                if k in raw and isinstance(raw[k], dict):
+                    raw = raw[k]; break
+        # Strip common prefixes
+        if isinstance(raw, dict):
+            for prefix in ('module.', 'aggregator.'):
+                if any(k.startswith(prefix) for k in raw.keys()):
+                    raw = {k[len(prefix):]: v for k, v in raw.items() if k.startswith(prefix)}
+                    print(f"  stripped prefix '{prefix}' from {len(raw)} keys")
+                    break
+        result = self.aggregator.load_state_dict(raw, strict=False)
+        print(f"  loaded: missing={len(result.missing_keys)} "
+              f"unexpected={len(result.unexpected_keys)}")
+        if result.missing_keys:
+            print(f"  e.g. missing: {result.missing_keys[:3]}")
+        if result.unexpected_keys:
+            print(f"  e.g. unexpected: {result.unexpected_keys[:3]}")
+
+    # ----- aliases for LoGoPlannerNet._apply_stage_freeze -------------------
+    # InternNav's `_apply_stage_freeze` freezes `state_encoder.encoder` (stage 1)
+    # and `state_encoder.decoder` + `state_encoder.register_token` (stage 2).
+    # Pi3 exposes these directly; for LingBot we proxy to the aggregator's
+    # patch_embed (ViT-L) and frame+global blocks. Use plain Python properties
+    # so the same nn.Modules are NOT re-registered as children of self (which
+    # would double-count parameters).
+    @property
+    def encoder(self):
+        return self.aggregator.patch_embed
+
+    @property
+    def decoder(self):
+        agg = self.aggregator
+        blocks = list(agg.frame_blocks) + list(agg.global_blocks)
+        class _DecoderProxy:
+            def parameters(self):
+                for b in blocks:
+                    yield from b.parameters()
+        return _DecoderProxy()
+
+    @property
+    def register_token(self):
+        return self.aggregator.register_token
 
     # ----- public forward ---------------------------------------------------
     def forward(self, imgs, depths):
