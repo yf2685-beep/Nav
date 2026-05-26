@@ -155,7 +155,23 @@ class GeometryModel_LingBot(nn.Module):
                     raw = {k[len(prefix):]: v for k, v in raw.items() if k.startswith(prefix)}
                     print(f"  stripped prefix '{prefix}' from {len(raw)} keys")
                     break
-        result = self.aggregator.load_state_dict(raw, strict=False)
+        # Drop keys whose tensor shape disagrees (e.g., pos_embed sized for
+        # LingBot's 518 res while we build at 224 — DINOv2 interpolates at
+        # forward time, so a missing pos_embed is fine; size-mismatched
+        # weights would otherwise make load_state_dict(strict=False) raise).
+        model_sd = self.aggregator.state_dict()
+        dropped = []
+        kept = {}
+        for k, v in raw.items():
+            if k in model_sd and hasattr(v, 'shape') and tuple(v.shape) != tuple(model_sd[k].shape):
+                dropped.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+            else:
+                kept[k] = v
+        if dropped:
+            print(f"  dropping {len(dropped)} shape-mismatched keys (kept {len(kept)})")
+            for k, sc, sm in dropped[:3]:
+                print(f"    drop {k}: ckpt {sc} vs model {sm}")
+        result = self.aggregator.load_state_dict(kept, strict=False)
         print(f"  loaded: missing={len(result.missing_keys)} "
               f"unexpected={len(result.unexpected_keys)}")
         if result.missing_keys:
