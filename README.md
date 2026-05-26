@@ -133,6 +133,41 @@ This is the only loss change that measurably improved SR on mini data
 (+4 SR points, SPL +0.07). With n=100 the SR delta is near the noise floor
 (±~5%), but the SPL gain is more robust; multi-scene evaluation would harden it.
 
+## LingBot-Map Backbone — Method 2 (this branch)
+
+Branch `method2-lingbot-v2` replaces Pi3 with LingBot-Map's `AggregatorStream`
+(frame attention + Geometric Context Attention) while **preserving** the
+DA-S depth-prior fusion that the original LoGoPlanner uses for absolute metric
+scale. Per-frame `state_token` and `scene_token` (both 384-d) feed the
+diffusion policy unchanged; Stage-1 supervision (`L_pose + L_local + L_world`)
+also stays identical because the new module exposes Pi3-compatible
+`LinearPts3d` heads. Code:
+[`geometry_model_lingbot.py`](NavDP/baselines/logoplanner/geometry_model_lingbot.py).
+
+Trigger with the `LOGO_BACKBONE` environment variable; default is the original
+Pi3 backbone:
+
+```bash
+# Method 2 — eval / inference
+LOGO_BACKBONE=lingbot_v2 \
+  python NavDP/baselines/logoplanner/logoplanner_server.py --port 19997 --checkpoint <ckpt>
+
+# Method 2 — training (Stage 1 / Stage 2 use the existing trainer; loss weights
+# control which stage)
+LOGO_BACKBONE=lingbot_v2 \
+  python InternNav/scripts/train/train.py --model-name logoplanner_stage1 ...
+
+# Smoke test: shape + NaN check on random (B=1, T=12, 168x308) tensors
+python NavDP/baselines/logoplanner/smoke_lingbot.py
+```
+
+> **Parallel work:** A complementary integration that **freezes LingBot-Map**
+> (GCTStream) and trains only an Adapter on top — dropping the DA-S depth
+> fusion — lives on branch
+> [`method1-lingbot-map`](https://github.com/yf2685-beep/Nav/tree/method1-lingbot-map),
+> triggered by `LOGO_BACKBONE=lingbot_map`. The two methods are intentionally
+> parallel so the role of the depth prior can be isolated.
+
 ## Artifacts & Paths
 
 Checkpoints and eval results are large and machine-local (not committed to git).
