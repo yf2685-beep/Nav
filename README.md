@@ -133,6 +133,35 @@ This is the only loss change that measurably improved SR on mini data
 (+4 SR points, SPL +0.07). With n=100 the SR delta is near the noise floor
 (±~5%), but the SPL gain is more robust; multi-scene evaluation would harden it.
 
+## LingBot-Map Backbone — Method 1 (this branch)
+
+Branch `method1-lingbot-map` replaces the Pi3 geometry backbone with a **frozen
+LingBot-Map** (`GCTStream`) + a trainable **Adapter** (AttnPool + Linear) that
+pools the aggregator's per-frame patch tokens into 384-d `state_token` /
+`scene_token` for the diffusion policy. This branch **drops** LoGoPlanner's
+DA-S depth-prior fusion and resizes inputs to 518×518 (LingBot's native
+resolution). Code: [`lingbot_map_geometry.py`](NavDP/baselines/logoplanner/lingbot_map_geometry.py).
+
+Trigger with the `LOGO_BACKBONE` environment variable; default is the original
+Pi3 backbone, so this branch's behaviour is unchanged for any caller that does
+not opt in:
+
+```bash
+# Stage-1 (geometric supervision — heads on Adapter output, real preds)
+LOGO_BACKBONE=lingbot_map LOGO_STAGE=1 \
+  python InternNav/scripts/train/train.py --model-name logoplanner_stage1 ...
+
+# Stage-2 / inference (no geometric heads, dummy zeros)
+LOGO_BACKBONE=lingbot_map LOGO_STAGE=2 \
+  python NavDP/baselines/logoplanner/logoplanner_server.py --port 19997 --checkpoint <ckpt>
+```
+
+> **Parallel work:** A complementary integration that **preserves the DA-S
+> depth fusion** and uses `AggregatorStream` (instead of the frozen GCTStream
+> + Adapter) lives on branch [`method2-lingbot-v2`](https://github.com/yf2685-beep/Nav/tree/method2-lingbot-v2),
+> triggered by `LOGO_BACKBONE=lingbot_v2`. The two methods are intentionally
+> parallel so the role of the depth prior can be isolated.
+
 ## Artifacts & Paths
 
 Checkpoints and eval results are large and machine-local (not committed to git).

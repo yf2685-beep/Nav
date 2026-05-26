@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import math
@@ -6,6 +7,18 @@ import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from policy_backbone import *
 from geometry_model import GeometryModel
+
+# Optional LingBot-Map causal backbone (set LOGO_BACKBONE=lingbot_map to enable).
+# Default ('pi3' or unset) keeps the original Pi3 path so comparisons stay simple.
+_LOGO_BACKBONE = os.environ.get('LOGO_BACKBONE', 'pi3').lower()
+# Stage selector for LingBot-Map mode:
+#   LOGO_STAGE=1 → build geometric heads on Adapter output, return real preds
+#                  (pair with w_pose/w_local/w_world > 0, w_diffusion/critic/subgoal = 0)
+#   LOGO_STAGE=2 (default) → no geometric heads, return dummy zeros (B 方案 / 论文 stage 2)
+_LOGO_STAGE = int(os.environ.get('LOGO_STAGE', '2'))
+if _LOGO_BACKBONE == 'lingbot_map':
+    from lingbot_map_geometry import LingBotMapGeometryModel
+
 
 class LoGoPlanner_Policy(nn.Module):
     def __init__(self,
@@ -31,7 +44,14 @@ class LoGoPlanner_Policy(nn.Module):
         
         # input encoders
         self.rgbd_encoder = NavDP_RGBD_Backbone(image_size,token_dim,memory_size=memory_size,device=device)
-        self.state_encoder = GeometryModel(context_size=context_size,device=device)
+        if _LOGO_BACKBONE == 'lingbot_map':
+            self.state_encoder = LingBotMapGeometryModel(
+                context_size=context_size,
+                device=device,
+                stage1_heads=(_LOGO_STAGE == 1),
+            )
+        else:
+            self.state_encoder = GeometryModel(context_size=context_size,device=device)
         self.point_encoder = nn.Linear(3,self.token_dim)
         
         self.start_encoder = nn.Linear(3,self.token_dim)
