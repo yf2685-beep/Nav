@@ -193,6 +193,12 @@ class GeometryModel_LingBot(nn.Module):
                         image_height=H, image_width=W,
                     )
 
+        # Defensively normalize tokens layout after the attention loop. The
+        # last global-attention block leaves tokens in (B, S*P, C) layout for
+        # cross-frame attention; we want (B*S, P, C) per-frame for the heads.
+        # .reshape is safe — element count is unchanged.
+        tokens = tokens.reshape(B * T, P_total, C)
+
         # (7) Pull out camera_token (idx 0) and patch tokens (after specials)
         cam_tok   = tokens[:, 0, :]                                # (B*T, 1024)
         patch_tok = tokens[:, self.patch_start_idx:, :]            # (B*T, P_patch, 1024)
