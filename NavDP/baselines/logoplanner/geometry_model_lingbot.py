@@ -206,6 +206,12 @@ class GeometryModel_LingBot(nn.Module):
 
     # ----- public forward ---------------------------------------------------
     def forward(self, imgs, depths):
+        # AggregatorStream's KV cache is designed for streaming inference and
+        # persists state across forward calls. For training, every batch must
+        # start with a fresh cache or backward fails ("graph traversed twice").
+        if hasattr(self.aggregator, 'clean_kv_cache'):
+            self.aggregator.clean_kv_cache()
+
         """Match the Pi3 GeometryModel signature.
 
         Args:
