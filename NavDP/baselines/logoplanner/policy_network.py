@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import math
@@ -6,6 +7,15 @@ import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from policy_backbone import *
 from geometry_model import GeometryModel
+
+# Method 2 (this branch): preserve LoGoPlanner's DA-S depth-prior fusion and
+# replace Pi3's bidirectional decoder with LingBot-Map's AggregatorStream
+# (frame attention + GCA). Enable via LOGO_BACKBONE=lingbot_v2.
+# Default ('pi3' or unset) keeps the original Pi3 path.
+_LOGO_BACKBONE = os.environ.get('LOGO_BACKBONE', 'pi3').lower()
+if _LOGO_BACKBONE == 'lingbot_v2':
+    from geometry_model_lingbot import GeometryModel_LingBot
+
 
 class LoGoPlanner_Policy(nn.Module):
     def __init__(self,
@@ -31,7 +41,11 @@ class LoGoPlanner_Policy(nn.Module):
         
         # input encoders
         self.rgbd_encoder = NavDP_RGBD_Backbone(image_size,token_dim,memory_size=memory_size,device=device)
-        self.state_encoder = GeometryModel(context_size=context_size,device=device)
+        if _LOGO_BACKBONE == 'lingbot_v2':
+            # Method 2: AggregatorStream + DA-S depth-prior fusion preserved.
+            self.state_encoder = GeometryModel_LingBot(context_size=context_size, device=device)
+        else:
+            self.state_encoder = GeometryModel(context_size=context_size,device=device)
         self.point_encoder = nn.Linear(3,self.token_dim)
         
         self.start_encoder = nn.Linear(3,self.token_dim)
