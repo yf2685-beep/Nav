@@ -298,6 +298,12 @@ def main(config, model_class, model_config_class):
                 depth_max=config.il.depth_max,
                 depth_min=config.il.depth_min,
                 critic_goal_weight=getattr(config.il, 'critic_goal_weight', 0.0),
+                sequential=getattr(config.il, 'sequential', False),
+                seq_stride=getattr(config.il, 'seq_stride', 1),
+                multistop=getattr(config.il, 'multistop', False),
+                subgoal_dist=getattr(config.il, 'subgoal_dist', 1.5),
+                subgoal_turn_deg=getattr(config.il, 'subgoal_turn_deg', 30.0),
+                subgoal_arrival=getattr(config.il, 'subgoal_arrival', 0.5),
             )
         else:
             if '3dgs' in config.il.lmdb_features_dir or '3dgs' in config.il.lmdb_features_dir:

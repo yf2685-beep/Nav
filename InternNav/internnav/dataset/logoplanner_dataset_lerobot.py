@@ -67,6 +67,12 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
         depth_max=5.0,
         depth_min=0.1,
         critic_goal_weight=0.0,
+        sequential=False,
+        seq_stride=1,
+        multistop=False,
+        subgoal_dist=1.5,
+        subgoal_turn_deg=30.0,
+        subgoal_arrival=0.5,
     ):
         super().__init__(
             root_dirs,
@@ -92,6 +98,125 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
         # from the goal, so the critic ranks goal-reaching — not just obstacle
         # avoidance. 0.0 keeps the original obstacle-only critic GT.
         self.critic_goal_weight = critic_goal_weight
+
+        # ---- Stage 2: LogoPlanner-style sequential / streaming sampling ----
+        # When sequential=True, each dataset item is a single (episode, timestep)
+        # pair read in temporal order (deterministic windows) instead of a
+        # randomly-sampled segment. This lets the model build a per-episode KV
+        # cache in Stage 3 (the cache stays in the model; the dataloader only
+        # guarantees ordering + boundary flags). Random-segment mode
+        # (sequential=False) is unchanged and stays the default.
+        self.sequential = sequential
+        self.seq_stride = max(1, int(seq_stride))
+        if self.sequential:
+            self._build_frame_index()
+
+        # ---- Stage 4: multi-stop subgoal navigation ----
+        # Instead of always conditioning on the FINAL goal image (which the robot
+        # often can't see → random walk), split each GT trajectory into several
+        # shorter subgoals and condition on the CURRENT (nearby, visible) subgoal.
+        # Subgoals are placed every `subgoal_dist` metres, with an extra subgoal
+        # whenever heading turns by more than `subgoal_turn_deg` since the last
+        # one; the final frame is always the last subgoal. GT-derived only — no
+        # learned subgoal selector yet (spec §4: stabilise the base first).
+        self.multistop = multistop
+        self.subgoal_dist = float(subgoal_dist)
+        self.subgoal_turn_deg = float(subgoal_turn_deg)
+        self.subgoal_arrival = float(subgoal_arrival)
+        self._subgoal_cache = {}
+
+    # ---- Stage 4: subgoal generation ----
+
+    def _compute_subgoals(self, extrinsics):
+        """Place subgoal frame indices along an ordered trajectory.
+
+        A subgoal is emitted every `subgoal_dist` metres of travelled distance OR
+        whenever heading turns by > `subgoal_turn_deg` since the last subgoal. The
+        final frame (L-1) is always the last subgoal.
+
+        Args:
+            extrinsics: (L, 4, 4) camera-to-world per frame (temporally ordered).
+        Returns:
+            np.int64 array of strictly increasing subgoal indices, ending at L-1.
+        """
+        L = extrinsics.shape[0]
+        if L <= 1:
+            return np.array([max(0, L - 1)], np.int64)
+        pos = extrinsics[:, 0:2, 3]                     # (L, 2) ground-plane xy
+        fwd = extrinsics[:, 0:2, 0]                     # (L, 2) forward axis (matches pose enc)
+        yaw = np.arctan2(fwd[:, 1], fwd[:, 0])          # (L,)
+        turn_rad = np.deg2rad(self.subgoal_turn_deg)
+
+        subgoals = []
+        acc_dist = 0.0
+        anchor_yaw = yaw[0]
+        for i in range(1, L):
+            acc_dist += float(np.linalg.norm(pos[i] - pos[i - 1]))
+            dyaw = abs(np.arctan2(np.sin(yaw[i] - anchor_yaw), np.cos(yaw[i] - anchor_yaw)))
+            if acc_dist >= self.subgoal_dist or dyaw >= turn_rad:
+                subgoals.append(i)
+                acc_dist = 0.0
+                anchor_yaw = yaw[i]
+        if not subgoals or subgoals[-1] != L - 1:
+            subgoals.append(L - 1)
+        return np.array(subgoals, np.int64)
+
+    def _get_subgoals(self, index, extrinsics):
+        """Subgoals are a property of the episode → compute once and cache."""
+        sg = self._subgoal_cache.get(index)
+        if sg is None:
+            sg = self._compute_subgoals(extrinsics)
+            self._subgoal_cache[index] = sg
+        return sg
+
+    @staticmethod
+    def _current_subgoal(subgoals, t):
+        """First subgoal strictly ahead of the current frame t (else the last)."""
+        for s in subgoals:
+            if s > t:
+                return int(s)
+        return int(subgoals[-1])
+
+    @staticmethod
+    def _next_subgoal(subgoals, current_idx):
+        """The subgoal after `current_idx` (else the final goal)."""
+        for s in subgoals:
+            if s > current_idx:
+                return int(s)
+        return int(subgoals[-1])
+
+    def _build_frame_index(self):
+        """Flatten every episode into ordered (traj_idx, t, is_first, is_last) frames.
+
+        Builds:
+          self.frame_index : list[(traj_idx, t, is_first, is_last)]   (len == __len__)
+          self.episodes    : list[list[flat_idx]]  one inner list per episode,
+                             frames in temporal order (consumed by the streaming
+                             batch sampler so different episodes never mix in a lane).
+        """
+        self.frame_index = []
+        self.episodes = []
+        for traj_idx in range(len(self.trajectory_dirs)):
+            n_frames = len(self.trajectory_rgb_path[traj_idx])
+            if n_frames < 2:
+                continue
+            ts = list(range(0, n_frames, self.seq_stride))
+            ep_flat = []
+            for k, t in enumerate(ts):
+                is_first = k == 0
+                is_last = k == len(ts) - 1
+                ep_flat.append(len(self.frame_index))
+                self.frame_index.append((traj_idx, t, is_first, is_last))
+            self.episodes.append(ep_flat)
+        print(
+            f'[LoGoPlanner sequential] {len(self.episodes)} episodes, '
+            f'{len(self.frame_index)} frames (stride={self.seq_stride})'
+        )
+
+    def __len__(self):
+        if getattr(self, 'sequential', False):
+            return len(self.frame_index)
+        return super().__len__()
 
     # ---- Context image/depth loading (aspect-preserving, not squared) ----
 
@@ -151,7 +276,11 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             [self.process_context_image(rgb_paths[i]) for i in memory_index]
         )
         context_depth = self.process_context_depth(depth_paths[start_step])
-        return context_image, context_depth, memory_index
+        # valid history positions (False = zero-padded because the window reaches
+        # before the episode start). Exposed so the model can mask padded frames.
+        memory_mask = np.zeros((self.memory_size,), np.bool_)
+        memory_mask[outrange_sum:] = True
+        return context_image, context_depth, memory_index, memory_mask
 
     # ---- Geometry GT computation ----
 
@@ -265,6 +394,20 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
     def __getitem__(self, index):
         start_time = time.time()
 
+        # Stage 2: sequential mode decodes a flat (episode, timestep) index and
+        # remaps `index` to the trajectory so every downstream self.*[index]
+        # access is correct. Random-segment mode leaves `index` untouched.
+        seq_episode_start = False
+        seq_done = False
+        seq_timestep = -1
+        if getattr(self, 'sequential', False):
+            traj_idx, t, is_first, is_last = self.frame_index[index]
+            index = traj_idx
+            seq_episode_start, seq_done, seq_timestep = bool(is_first), bool(is_last), int(t)
+            # per-episode seed → augmentation multipliers stay consistent across
+            # the frames of one episode (temporal consistency for the same trajectory).
+            np.random.seed(traj_idx % (2 ** 31 - 1))
+
         (
             camera_intrinsic,
             trajectory_base_extrinsic,
@@ -275,7 +418,13 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
         trajectory_path_points, _ = self.process_path_points(index)
         trajectory_obstacle_points, _ = self.process_obstacle_points(index, trajectory_path_points)
 
-        if self.prior_sample:
+        if getattr(self, 'sequential', False):
+            # deterministic windows: current frame = t, goal = trajectory end.
+            memory_start_choice = int(min(seq_timestep, trajectory_length - 2))
+            memory_start_choice = max(0, memory_start_choice)
+            target_choice = trajectory_length - 1
+            pixel_start_choice = 0
+        elif self.prior_sample:
             pixel_start_choice, target_choice = self.rank_steps(
                 trajectory_extrinsics, trajectory_obstacle_points
             )
@@ -285,6 +434,16 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             target_choice = np.random.randint(pixel_start_choice + 1, trajectory_length - 1)
             memory_start_choice = np.random.randint(pixel_start_choice, target_choice)
 
+        # Stage 4: multi-stop — retarget from the trajectory endpoint to the
+        # CURRENT subgoal (first subgoal ahead of memory_start_choice). This makes
+        # point_goal / pred_actions / goal_image all subgoal-local downstream.
+        current_subgoal_idx = None
+        if getattr(self, 'multistop', False):
+            subgoals = self._get_subgoals(index, trajectory_extrinsics)
+            current_subgoal_idx = self._current_subgoal(subgoals, memory_start_choice)
+            target_choice = int(max(current_subgoal_idx, memory_start_choice + 1))
+            target_choice = min(target_choice, trajectory_length - 1)
+
         if self.random_digit:
             memory_digit = np.random.randint(2, 8)
             pred_digit = memory_digit
@@ -292,7 +451,7 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             memory_digit = 4
             pred_digit = 4
 
-        memory_images, depth_image, _ = self.process_memory(
+        memory_images, depth_image, _, memory_mask = self.process_memory(
             self.trajectory_rgb_path[index],
             self.trajectory_depth_path[index],
             memory_start_choice,
@@ -398,8 +557,68 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             )
             self.batch_time_sum = 0.0
 
+        # Phase α: goal_image = RGB at the trajectory endpoint (the "target view").
+        # Same shape/preprocessing as context frames so downstream encoders fit.
+        # Falls back to the last in-range context frame if endpoint is out of range.
+        _last_step = min(int(trajectory_length) - 1, len(self.trajectory_rgb_path[index]) - 1)
+        try:
+            final_goal_image = self.process_context_image(self.trajectory_rgb_path[index][_last_step])
+        except Exception:
+            final_goal_image = context_rgb[-1]
+
+        # --- Stage 4: multi-stop subgoal images + metadata ---
+        # In multistop mode the model's goal_image is the CURRENT subgoal view
+        # (nearby, usually visible) rather than the final destination. We also
+        # emit the next subgoal + the final goal so downstream / inference logic
+        # can switch subgoals and fall back to the final goal at the end.
+        if getattr(self, 'multistop', False) and current_subgoal_idx is not None:
+            subgoals = self._get_subgoals(index, trajectory_extrinsics)
+            next_subgoal_idx = self._next_subgoal(subgoals, current_subgoal_idx)
+            _cs = min(current_subgoal_idx, _last_step)
+            _ns = min(next_subgoal_idx, _last_step)
+            try:
+                subgoal_image = self.process_context_image(self.trajectory_rgb_path[index][_cs])
+            except Exception:
+                subgoal_image = final_goal_image
+            try:
+                next_subgoal_image = self.process_context_image(self.trajectory_rgb_path[index][_ns])
+            except Exception:
+                next_subgoal_image = final_goal_image
+            goal_image = subgoal_image  # model conditions on the current subgoal
+            # reached: current frame is within arrival distance of the subgoal xy
+            _cur_xy = trajectory_extrinsics[memory_start_choice, 0:2, 3]
+            _sg_xy = trajectory_extrinsics[_cs, 0:2, 3]
+            subgoal_reached = bool(np.linalg.norm(_sg_xy - _cur_xy) < self.subgoal_arrival)
+            num_subgoals = int(len(subgoals))
+        else:
+            goal_image = final_goal_image
+            subgoal_image = final_goal_image
+            next_subgoal_image = final_goal_image
+            current_subgoal_idx = _last_step if current_subgoal_idx is None else current_subgoal_idx
+            subgoal_reached = False
+            num_subgoals = 1
+
+        # --- Stage 2 metadata: episode bookkeeping + history mask + robot pose ---
+        # robot_pose: absolute world pose of the current (memory_start) frame,
+        # encoded [x, y, z, sinθ, cosθ] (same convention as gt_camera_poses).
+        robot_pose = self._pose_to_xyzsincos(cur_ext[0:3, 0:3], cur_ext[0:3, 3])
+        if getattr(self, 'sequential', False):
+            episode_id = index
+            timestep = seq_timestep
+            episode_start = seq_episode_start
+            done = seq_done
+        else:
+            # random-segment mode: derive flags from the sampled current step so the
+            # keys always exist (collate/trainer stay uniform across both modes).
+            episode_id = index
+            timestep = int(memory_start_choice)
+            episode_start = bool(memory_start_choice == 0)
+            done = bool(memory_start_choice >= trajectory_length - 1)
+        reset_cache = episode_start  # reset the model's KV cache at each episode start
+
         return {
             'point_goal': torch.tensor(point_goal, dtype=torch.float32),
+            'goal_image': torch.tensor(goal_image, dtype=torch.float32),
             'memory_rgb': torch.tensor(memory_images, dtype=torch.float32),
             'memory_depth': torch.tensor(depth_image, dtype=torch.float32),
             'context_rgb': torch.tensor(context_rgb, dtype=torch.float32),
@@ -412,11 +631,27 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             'gt_local_points': torch.tensor(gt_local_points, dtype=torch.float32),
             'gt_world_points': torch.tensor(gt_world_points, dtype=torch.float32),
             'gt_subgoal': torch.tensor(gt_subgoal, dtype=torch.float32),
+            # Stage 2 sequential / KV-cache metadata
+            'memory_mask': torch.tensor(memory_mask, dtype=torch.bool),
+            'context_mask': torch.tensor(context_mask, dtype=torch.bool),
+            'robot_pose': torch.tensor(robot_pose, dtype=torch.float32),
+            'episode_id': torch.tensor(episode_id, dtype=torch.long),
+            'timestep': torch.tensor(timestep, dtype=torch.long),
+            'episode_start': torch.tensor(episode_start, dtype=torch.bool),
+            'reset_cache': torch.tensor(reset_cache, dtype=torch.bool),
+            'done': torch.tensor(done, dtype=torch.bool),
+            # Stage 4 multi-stop subgoal fields
+            'subgoal_image': torch.tensor(subgoal_image, dtype=torch.float32),
+            'next_subgoal_image': torch.tensor(next_subgoal_image, dtype=torch.float32),
+            'final_goal_image': torch.tensor(final_goal_image, dtype=torch.float32),
+            'current_subgoal_idx': torch.tensor(int(current_subgoal_idx), dtype=torch.long),
+            'subgoal_reached': torch.tensor(subgoal_reached, dtype=torch.bool),
+            'num_subgoals': torch.tensor(num_subgoals, dtype=torch.long),
         }
 
 
 def logoplanner_collate_fn(batch):
-    return {
+    out = {
         'batch_pg':              torch.stack([b['point_goal']       for b in batch]),
         'batch_memory_rgb':      torch.stack([b['memory_rgb']       for b in batch]),
         'batch_memory_depth':    torch.stack([b['memory_depth']     for b in batch]),
@@ -431,3 +666,25 @@ def logoplanner_collate_fn(batch):
         'batch_gt_world_points': torch.stack([b['gt_world_points']  for b in batch]),
         'batch_gt_subgoal':      torch.stack([b['gt_subgoal']       for b in batch]),
     }
+    if 'goal_image' in batch[0]:
+        out['batch_goal_image'] = torch.stack([b['goal_image'] for b in batch])
+    # Stage 2 sequential / KV-cache metadata (present in both modes).
+    for src, dst in [
+        ('memory_mask', 'batch_memory_mask'),
+        ('context_mask', 'batch_context_mask'),
+        ('robot_pose', 'batch_robot_pose'),
+        ('episode_id', 'batch_episode_id'),
+        ('timestep', 'batch_timestep'),
+        ('episode_start', 'batch_episode_start'),
+        ('reset_cache', 'batch_reset_cache'),
+        ('done', 'batch_done'),
+        ('subgoal_image', 'batch_subgoal_image'),
+        ('next_subgoal_image', 'batch_next_subgoal_image'),
+        ('final_goal_image', 'batch_final_goal_image'),
+        ('current_subgoal_idx', 'batch_current_subgoal_idx'),
+        ('subgoal_reached', 'batch_subgoal_reached'),
+        ('num_subgoals', 'batch_num_subgoals'),
+    ]:
+        if src in batch[0]:
+            out[dst] = torch.stack([b[src] for b in batch])
+    return out

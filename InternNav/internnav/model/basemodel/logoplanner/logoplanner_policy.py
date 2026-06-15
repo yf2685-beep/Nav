@@ -104,6 +104,9 @@ class LoGoPlannerNet(PreTrainedModel):
         self.input_channels = il['channels']
         self.token_dim = il['token_dim']
         self.context_size = il.get('context_size', 12)
+        # Stage 1: RGB-only trajectory backbone. Default True keeps legacy
+        # (depth-on) behaviour for configs that predate this flag.
+        self.use_depth = il.get('use_depth', True)
 
         self.policy = LoGoPlanner_Policy(
             image_size=self.image_size,
@@ -114,6 +117,7 @@ class LoGoPlannerNet(PreTrainedModel):
             heads=self.attention_heads,
             token_dim=self.token_dim,
             channels=self.input_channels,
+            use_depth=self.use_depth,
             device=self._device,
         )
 
@@ -195,7 +199,9 @@ class LoGoPlannerNet(PreTrainedModel):
         time_embeds = p.time_emb(timesteps).unsqueeze(1)
         noisy_action = p.noise_scheduler.add_noise(action, noise, timesteps)
         noisy_action_embed = p.input_embed(noisy_action)
-        return noise, time_embeds, noisy_action_embed
+        # also return raw noisy_action + timesteps so forward() can reconstruct the
+        # predicted clean trajectory (x0) for the Stage-7 safety loss.
+        return noise, time_embeds, noisy_action_embed, noisy_action, timesteps
 
     def forward(
         self,
@@ -227,7 +233,9 @@ class LoGoPlannerNet(PreTrainedModel):
         )
 
         # --- encode memory + context (real forward paths of LoGoPlanner_Policy)
-        rgbd_embed = p.rgbd_encoder(mem_rgb, mem_depth)  # (B, M, D)
+        # Stage 1: depth is dropped from the trajectory backbone when use_depth
+        # is False; mem_depth stays in the batch (collision critic uses it).
+        rgbd_embed = p.rgbd_encoder(mem_rgb, mem_depth if self.use_depth else None)  # (B, M, D)
         (_, state_token, scene_token), (camera_poses_pred, local_points_pred, world_points_pred) = (
             p.state_encoder(ctx_rgb, ctx_depth)
         )
@@ -239,8 +247,8 @@ class LoGoPlannerNet(PreTrainedModel):
         subgoal_pred = p.pg_pred_mlp(state_embed).squeeze(1)  # (B, 3)
 
         # --- diffusion: sample noise for ng and mg branches
-        ng_noise, ng_time_embed, ng_noisy_action_embed = self._sample_noise(labels)
-        mg_noise, mg_time_embed, mg_noisy_action_embed = self._sample_noise(labels)
+        ng_noise, ng_time_embed, ng_noisy_action_embed, _, _ = self._sample_noise(labels)
+        mg_noise, mg_time_embed, mg_noisy_action_embed, mg_noisy_action, mg_timesteps = self._sample_noise(labels)
 
         nogoal_embed = torch.zeros_like(startgoal_embed)  # (B, 1, D)
 
@@ -267,6 +275,14 @@ class LoGoPlannerNet(PreTrainedModel):
         mg_out = p.layernorm(mg_out)
         noise_pred_mg = p.action_head(mg_out)
 
+        # --- Stage 7: reconstruct the predicted CLEAN trajectory (x0) from the mg
+        # epsilon prediction, one-step (differentiable wrt the policy). The action
+        # head predicts ε; x0 = (x_t - sqrt(1-ᾱ_t)·ε) / sqrt(ᾱ_t). Waypoint xy is
+        # the cumulative sum of the per-step deltas (÷4, matching inference).
+        abar = p.noise_scheduler.alphas_cumprod.to(device)[mg_timesteps].view(-1, 1, 1)
+        x0_pred_mg = (mg_noisy_action - (1.0 - abar).sqrt() * noise_pred_mg) / abar.sqrt().clamp_min(1e-6)
+        pred_traj_mg = torch.cumsum(x0_pred_mg / 4.0, dim=1)  # (B, T, 3) robot-frame waypoints
+
         # --- critic on GT labels and augments (no-goal cond, masked per cond_critic_mask)
         label_embed = p.input_embed(labels).detach()
         augment_embed = p.input_embed(augments).detach()
@@ -292,4 +308,5 @@ class LoGoPlannerNet(PreTrainedModel):
             'local_points_pred': local_points_pred,
             'world_points_pred': world_points_pred,
             'subgoal_pred': subgoal_pred,
+            'pred_traj_mg': pred_traj_mg,  # Stage 7: predicted clean waypoints (B, T, 3)
         }
