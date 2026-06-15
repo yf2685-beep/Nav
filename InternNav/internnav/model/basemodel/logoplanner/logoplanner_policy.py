@@ -212,7 +212,12 @@ class LoGoPlannerNet(PreTrainedModel):
         batch_context_depth,
         batch_labels,
         batch_augments,
+        batch_goal_image=None,
     ):
+        # batch_goal_image is supplied by the trainer for image-goal (Phase α) mode.
+        # The point-goal / multi-stop path conditions on batch_pg (the subgoal point),
+        # so we accept and ignore it here unless image-goal mode is wired in.
+        _ = batch_goal_image
         p = self.policy
         device = next(self.parameters()).device
 
