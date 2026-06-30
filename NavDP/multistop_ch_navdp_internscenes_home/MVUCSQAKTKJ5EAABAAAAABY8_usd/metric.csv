@@ -1,0 +1,3 @@
+episode,reached_A,reached_B,b_valid,b_forced,spl_A,spl_B,euclid_A,euclid_B,legA_len,legB_len,arm
+1,0.0,nan,0.0,0.0,0.0,nan,5.740642547607422,0.0,58.680471662431955,0.0,ch
+2,0.0,nan,0.0,0.0,0.0,nan,9.204570770263672,0.0,59.6326980633894,0.0,ch

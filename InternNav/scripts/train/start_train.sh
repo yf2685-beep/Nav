@@ -48,6 +48,12 @@ case $MODEL in
         export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
         NUM_GPUS=8
         ;;
+    "memnav")
+        # single-GPU by default; on HPC pre-set CUDA_VISIBLE_DEVICES (e.g. 0,1,2,3) and
+        # NUM_GPUS is inferred from it — multi-GPU goes through torchrun (DDP) below.
+        export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+        NUM_GPUS=${NUM_GPUS:-$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)}
+        ;;
     *)
         echo "Error: Unsupported model type: $MODEL"
         exit 1
@@ -65,8 +71,8 @@ export TORCH_SHOW_CPP_STACKTRACES=1
 export TORCH_CPP_LOG_LEVEL=INFO
 export NCCL_DEBUG=INFO
 
-# Check if model is rdp to use python, otherwise use torchrun
-if [[ "$MODEL" == "navdp" ]]; then
+# navdp + memnav train with DDP via torchrun; others use plain python
+if [[ "$MODEL" == "navdp" || "$MODEL" == "memnav" ]]; then
     echo "Using torchrun to start $MODEL training, using $NUM_GPUS GPUs (CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES)"
     torchrun \
         --nproc_per_node=$NUM_GPUS \

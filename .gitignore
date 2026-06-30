@@ -98,3 +98,7 @@ data/
 kujiale_data/
 interiornav_data/
 images/
+
+# --- Vendored third-party repos (clone separately; weights too big for GitHub) ---
+InternNav/internnav/model/basemodel/Long-CLIP/
+NavDP/baselines/memnav/lingbot-map/

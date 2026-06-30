@@ -1,8 +1,92 @@
-# LoGoPlanner Training Notes
+# Evaluation of NavDP with multi-stop goals:
 
-Setup, dataset preparation, and trainer design notes for reproducing **Stage 2** of LoGoPlanner training on top of the NavDP codebase, using the InternData-N1 mini dataset.
+ | Metric | Value |
+|---------- |----------|
+| SR_A      | 0.55 (11/20) |
+| SR_B \| A | 0.00 (0/11)  |
+| SPL_A (successes) | 1.00 — leg A is near-optimal when it succeeds |
+| b_forced | 0.00 — every A→B switch via clean dwell/stop (switch logic validated) |
+| mean euclid_B / legB_len | 5.2 m goal, 50 m driven — wanders to timeout |
 
----
+
+## why the robot never get back to point B
+| Frame | Goal rel (m) | Dist to B | What's happening |
+|---------|---------|---------|---------|
+| 4% (just switched) | ~(2.0, …) | ~2 m | B is right there, behind the robot |
+| 10% | (−2.94, 1.11) | ~3 m | |
+| 30% | (−13.0, −4.4) | ~14 m | Driving away |
+| 50% | (−17.7, −17.0) | ~25 m | |
+| 70% | (−30.8, 17.7) | ~35 m | Farthest from B |
+| 90% | (−27.1, 30.6) | ~41 m | Still wandering |
+| 99% | (−4.95, −17.6) | ~18 m | Times out, never returns |
+
+
+### Data loader: 
+
+Data loader is complete and validated: 
+
+- batch_goal_image:          (8, 3, 518, 518)      goal RGB (dense DINO of goal)
+- batch_window_images:       (8, 8, 3, 518, 518)   current local window [k-7..k]    (dense DINO + GCT window-forward)
+- batch_goal_cls:            (8, 1024)             retrieval query + raw descriptor
+- batch_mem_cls:             (8, Lmax, 1024) +mask dino_cls retrieval keys [0..k]
+- batch_retrieval_target, batch_is_seen            seen/unseen supervision
+- batch_labels/augments, *_critic                  NavDP action + critic targets
+- cache_paths, rgb_dirs, cur_steps, goal_steps     pointers (KV cache + lazy match images)
+
+
+# Model Design 
+
+## Append goal to retrieved match
+
+  Appending the goal as a frame after its retrieved match, and reading GCT's camera-pose head, gives an accurate goal location in the map
+
+  This table shows if we insert goal into a frame slightly off (40 frame away from GT), what does perfomance degrade in Lingbot-map.  
+  | Δ (match→goal gap) | physical dist | rotation err | position err |
+  |-------------------|---------------|--------------|--------------|
+  | 1  | 0.04 m | 0.00° | 0.000 m |
+  | 3  | 0.11 m | 0.18° | 0.012 m |
+  | 5  | 0.18 m | 0.52° | 0.027 m |
+  | 10 | 0.34 m | 0.60° | 0.034 m |
+  | 20 | 0.67 m | 0.58° | 0.030 m |
+  | 40 | 1.42 m | 0.42° | 0.037 m |
+
+
+## How to set up the condition for DM 
+
+#### summary of existing approaches 
+| Model | Mechanism | Conditioning |
+|--------|-----------|--------------|
+| **NavDP** | **TransformerDecoder** — 24 action tokens (tgt, causal) cross-attend to memory | `memory = [time, goal_embed×3, rgbd_embed]`. `goal_embed` is already fused = `image_encoder(concat(goal, current[-1]))` (6-ch). So fused goal is used as cross-attention memory tokens. |
+| **LoGoPlanner** | Same **TransformerDecoder** cross-attention | `memory = [time, goal_embed×3, rgbd_embed, unify_token]` — separate tokens: `goal_embed` = state (goal position via `state_decoder`), `unify_token` = geometry (collision), `rgbd_embed` = memory. |
+| **NoMaD** | **ConditionalUnet1D** — FiLM modulation, no attention | `global_cond` = single fused vector = mean-pooled `vision_encoder(obs, goal)` (EfficientNet 6-ch fusion + transformer + mean). |
+
+
+### Cam pose head also use causal inference
+
+ Shape of the cache: [N, 4, 4, 16, 128] (frame x iter xblock x headsx head_dim)
+- camera_head.kv_cache = list of 4 dicts (num_iterations=4)
+  - each dict: k_0,v_0, ..., k_3,v_3   (trunk_depth=4 blocks)
+  - each k/v:  [B, 16 heads, F frames, 1 token, 128]  and 1 camera token per frame
+
+#### Design of pose merging head 
+
+- Revisit input: raw aggregator camera token -> frozen camera-head causal feature ->camera head's accumulated absolute pose (option b, with the lingbot_cam_cache.npz re-stream).
+- Pose representation: _pose7 drops FoV and normalizes the quaternion ->clean [T, unit-quat]; PoseEncoder = Linear(7, dim) (LingBot's embed_pose design).
+- Relative pose: learned via the shared TokenCompressor, calibrated by the aux_pose loss.
+
+
+#### Overall model structure
+
+| component | design |
+|-----------|--------|
+| `current_state` | post-GCT (RGBD) + depth-head feature, Perceiver-compressed |
+| `revisit` | camera-head abs pose → `[T, unit-quat]` → learned relative + aux pose |
+| `novel` | early-fusion 6-ch DINOv2-S on raw current+goal |
+| `gate` | retrieval confidence → cross-attention bias (no multiply) |
+| `decoder` | NavDP DDPM, ng/mg; no critic (geometric collision at eval) |
+
+
+
 
 ## 1. Dataset
 

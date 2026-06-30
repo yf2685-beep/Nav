@@ -17,14 +17,16 @@ from internnav.dataset.cma_lerobot_dataset import CMALerobotDataset, cma_collate
 from internnav.dataset.rdp_lerobot_dataset import RDP_LerobotDataset, rdp_collate_fn
 from internnav.dataset.navdp_dataset_lerobot import NavDP_Base_Datset, navdp_collate_fn
 from internnav.dataset.logoplanner_dataset_lerobot import LoGoPlanner_Dataset, logoplanner_collate_fn
+from internnav.dataset.memnav_dataset_lerobot import MemNav_Dataset, memnav_collate_fn
 from internnav.model.basemodel.cma.cma_policy import CMAModelConfig, CMANet
 from internnav.model.basemodel.rdp.rdp_policy import RDPModelConfig, RDPNet
 from internnav.model.basemodel.seq2seq.seq2seq_policy import Seq2SeqModelConfig, Seq2SeqNet
 from internnav.model.basemodel.navdp.navdp_policy import NavDPModelConfig, NavDPNet
 from internnav.model.basemodel.logoplanner.logoplanner_policy import LoGoPlannerModelConfig, LoGoPlannerNet
+from internnav.model.basemodel.memnav.memnav_policy import MemNavModelConfig, MemNavPolicy
 from internnav.model.utils.logger import MyLogger
 from internnav.model.utils.utils import load_dataset
-from internnav.trainer import CMATrainer, RDPTrainer, NavDPTrainer, LoGoPlannerTrainer
+from internnav.trainer import CMATrainer, RDPTrainer, NavDPTrainer, LoGoPlannerTrainer, MemNavTrainer
 from scripts.train.configs import (
     cma_exp_cfg,
     cma_plus_exp_cfg,
@@ -33,6 +35,7 @@ from scripts.train.configs import (
     seq2seq_plus_exp_cfg,
     navdp_exp_cfg,
     logoplanner_exp_cfg,
+    memnav_exp_cfg,
 )
 import sys
 from datetime import datetime
@@ -134,7 +137,7 @@ def main(config, model_class, model_config_class):
         print(f"  MASTER_ADDR: {os.getenv('MASTER_ADDR', 'Not set')}")
         print(f"  MASTER_PORT: {os.getenv('MASTER_PORT', 'Not set')}")
 
-        if config.model_name in ("navdp", "logoplanner"):
+        if config.model_name in ("navdp", "logoplanner", "memnav"):
             local_rank = int(os.getenv('LOCAL_RANK', '0'))
             world_size = int(os.getenv('WORLD_SIZE', '1'))
             rank = int(os.getenv('RANK', '0'))
@@ -175,7 +178,7 @@ def main(config, model_class, model_config_class):
         if config.il.ckpt_to_load:
             print(f"load model from:{config.il.ckpt_to_load}")
         model = model_class.from_pretrained(pretrained_model_name_or_path=config.il.ckpt_to_load, config=model_cfg)
-        if config.model_name in ("navdp", "logoplanner"):
+        if config.model_name in ("navdp", "logoplanner", "memnav"):
             model.to(device)
             # Check that all parameters and buffers are on the correct device
             for name, param in model.named_parameters():
@@ -210,7 +213,7 @@ def main(config, model_class, model_config_class):
         transformers_logger = logging.getLogger("transformers")
         if transformers_logger.hasHandlers():
             transformers_logger.handlers = []
-        if config.model_name in ("navdp", "logoplanner") and local_rank in [0, -1]:  # Only main process or non-distributed
+        if config.model_name in ("navdp", "logoplanner", "memnav") and local_rank in [0, -1]:  # Only main process or non-distributed
             transformers_logger.addHandler(train_logger.handlers[0])
         transformers_logger.setLevel(logging.INFO)
 
@@ -244,6 +247,13 @@ def main(config, model_class, model_config_class):
                 context_image_width=config.il.context_image_width,
                 depth_max=config.il.depth_max,
                 depth_min=config.il.depth_min,
+            )
+        elif config.model_name == "memnav":
+            train_dataset_data = MemNav_Dataset(
+                config.il.root_dir,
+                predict_size=config.il.predict_size,
+                image_size=config.il.image_size,
+                lingbot_repo=config.il.lingbot_repo,
             )
         else:
             if '3dgs' in config.il.lmdb_features_dir or '3dgs' in config.il.lmdb_features_dir:
@@ -289,6 +299,10 @@ def main(config, model_class, model_config_class):
             policy_trainer = LoGoPlannerTrainer
             train_dataset = train_dataset_data
             collate_fn = logoplanner_collate_fn
+        elif config.model_name == 'memnav':
+            policy_trainer = MemNavTrainer
+            train_dataset = train_dataset_data
+            collate_fn = memnav_collate_fn
 
         # ------------ training args ------------
         training_args = TrainingArguments(
@@ -370,6 +384,7 @@ if __name__ == '__main__':
         'rdp': [rdp_exp_cfg, RDPNet, RDPModelConfig],
         'navdp': [navdp_exp_cfg, NavDPNet, NavDPModelConfig],
         'logoplanner': [logoplanner_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
+        'memnav': [memnav_exp_cfg, MemNavPolicy, MemNavModelConfig],
     }
 
     if config.model_name not in supported_cfg:

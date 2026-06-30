@@ -180,6 +180,7 @@ class NavDPNet(PreTrainedModel):
         return critic_output
 
     def forward(self, goal_point, goal_image, goal_pixel, input_images, input_depths, output_actions, augment_actions):
+        import pdb; pdb.set_trace()
         # """get device safely"""
         # # get device safely
         # try:
