@@ -86,9 +86,49 @@ def logoplanner_step_xy():
     phase2_time = time.time()
     execute_trajectory, all_trajectory, all_values, trajectory_mask, sub_pointgoal_pd = logoplanner_navigator.step_pointgoal(goal,image,depth)
     phase3_time = time.time()
-    logoplanner_fps_writer.append_data(trajectory_mask)
+    try:
+        logoplanner_fps_writer.append_data(trajectory_mask)
+    except Exception:
+        pass  # video writer fallback (e.g. no ffmpeg) — never crash the server
     phase4_time = time.time()
     print("phase1:%f, phase2:%f, phase3:%f, phase4:%f, all:%f"%(phase1_time - start_time, phase2_time - phase1_time, phase3_time - phase2_time, phase4_time-phase3_time, time.time() - start_time))
+
+    return jsonify({'trajectory': execute_trajectory.tolist(),
+                    'all_trajectory': all_trajectory.tolist(),
+                    'all_values': all_values.tolist(),
+                    'sub_pointgoal_pd': sub_pointgoal_pd.tolist()})
+
+@app.route("/imagegoal_step", methods=['POST'])
+def logoplanner_step_imagegoal():
+    """Phase α: image-goal inference endpoint.
+    Client sends an extra 'goal' file (JPEG-encoded goal image, same wire format
+    as pointgoal but the 'goal_data' form is absent). See client_utils.imagegoal_step.
+    """
+    global logoplanner_navigator, logoplanner_fps_writer
+    start_time = time.time()
+    image_file = request.files['image']
+    depth_file = request.files['depth']
+    goal_file = request.files['goal']
+    batch_size = logoplanner_navigator.batch_size
+
+    image = np.asarray(Image.open(image_file.stream).convert('RGB'))
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    image = image.reshape((batch_size, -1, image.shape[1], 3))
+
+    depth = np.asarray(Image.open(depth_file.stream).convert('I'))[:, :, np.newaxis].astype(np.float32) / 10000.0
+    depth = depth.reshape((batch_size, -1, depth.shape[1], 1))
+
+    goal_img = np.asarray(Image.open(goal_file.stream).convert('RGB'))
+    goal_img = cv2.cvtColor(goal_img, cv2.COLOR_RGB2BGR)
+    goal_img = goal_img.reshape((batch_size, -1, goal_img.shape[1], 3))
+
+    execute_trajectory, all_trajectory, all_values, trajectory_mask, sub_pointgoal_pd = \
+        logoplanner_navigator.step_imagegoal(goal_img, image, depth)
+    try:
+        logoplanner_fps_writer.append_data(trajectory_mask)
+    except Exception:
+        pass
+    print(f"imagegoal step total: {time.time() - start_time:.3f}s")
 
     return jsonify({'trajectory': execute_trajectory.tolist(),
                     'all_trajectory': all_trajectory.tolist(),
@@ -119,7 +159,10 @@ def logoplanner_step_nogoal():
     phase2_time = time.time()
     execute_trajectory, all_trajectory, all_values, trajectory_mask = logoplanner_navigator.step_nogoal(image,depth)
     phase3_time = time.time()
-    logoplanner_fps_writer.append_data(trajectory_mask)
+    try:
+        logoplanner_fps_writer.append_data(trajectory_mask)
+    except Exception:
+        pass
     phase4_time = time.time()
     print("phase1:%f, phase2:%f, phase3:%f, phase4:%f, all:%f"%(phase1_time - start_time, phase2_time - phase1_time, phase3_time - phase2_time, phase4_time-phase3_time, time.time() - start_time))
     return jsonify({'trajectory': execute_trajectory.tolist(),

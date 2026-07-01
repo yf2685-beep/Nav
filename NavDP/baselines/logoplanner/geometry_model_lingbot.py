@@ -73,10 +73,18 @@ class GeometryModel_LingBot(nn.Module):
         use_sdpa=True,               # SDPA backend = no FlashInfer dependency
     )
 
-    def __init__(self, context_size=12, device='cuda:0', pretrained_ckpt=None, **kwargs):
+    def __init__(self, context_size=12, device='cuda:0', pretrained_ckpt=None,
+                 n_anchor=8, **kwargs):
         super().__init__()
         self.context_size = context_size
         self.device = device
+        # Number of leading "anchor" frames (LingBot-Map scale frames). These get
+        # bidirectional attention among themselves and fix the metric scale /
+        # coordinate frame for the rest of the episode. The old code hardcoded 1;
+        # streaming navigation uses 8 (paper default). For the parallel training
+        # forward this makes the first n_anchor frames mutually attended; for
+        # frame-by-frame streaming it marks which frames carry the scale token.
+        self.n_anchor = n_anchor
 
         # 1. LingBot AggregatorStream (DINOv2 patch_embed + alternating frame/GCA blocks)
         cfg = {**self.DEFAULTS, **kwargs}
@@ -300,7 +308,7 @@ class GeometryModel_LingBot(nn.Module):
 
         # (4) Prepend LingBot special tokens (camera + register + scale)
         special_tokens = self.aggregator._prepare_special_tokens(
-            B, T, T, C, num_frame_for_scale=1,
+            B, T, T, C, num_frame_for_scale=self.n_anchor,
         )  # (B*T, num_special, 1024)
         tokens = torch.cat([special_tokens, fused], dim=1)
         # tokens: (B*T, P_total, 1024)
@@ -321,7 +329,7 @@ class GeometryModel_LingBot(nn.Module):
                 elif attn_type == 'global':
                     tokens, global_idx, global_inter = self.aggregator._process_global_attention(
                         tokens, B, T, T, P_total, C, global_idx,
-                        pos=pos, num_frame_for_scale=1,
+                        pos=pos, num_frame_for_scale=self.n_anchor,
                         sliding_window_size=None, num_frame_per_block=1,
                         image_height=H, image_width=W,
                     )
@@ -349,6 +357,40 @@ class GeometryModel_LingBot(nn.Module):
         scene_token = self.scene_compressor(scene_token).reshape(B, T, 384)
 
         return ([tokens, state_token, scene_token],
+                [camera_poses, local_points, world_points])
+
+    # ----- Streaming window encode (memory-bounded training/eval) -----------
+    @torch.no_grad()
+    def encode_window_streaming(self, imgs, depths):
+        """Stream an N-frame window through the persistent KV cache and return
+        per-frame tokens — same outputs as :meth:`forward` but with attention
+        memory bounded by the sliding window instead of the parallel O(N^2)
+        global attention. Frozen-backbone (no_grad) only.
+
+        Args:
+            imgs:   (B, N, H, W, 3), depths: (B, N, H, W, 1). Frames in order.
+        Returns:
+            ([None, state_token, scene_token], [camera_poses, local_points, world_points])
+            with state/scene (B, N, 384) and geometry preds (B, N, ...).
+        """
+        imgs = torch.as_tensor(imgs, dtype=torch.float32, device=self.device)
+        depths = torch.as_tensor(depths, dtype=torch.float32, device=self.device)
+        B, N = imgs.shape[:2]
+        self.reset_kv_cache()
+        states, scenes, cams, locs, wlds = [], [], [], [], []
+        for t in range(N):
+            (_, st, sc), (cp, lp, wp) = self.forward(
+                imgs[:, t:t + 1], depths[:, t:t + 1],
+                reset_cache=(t == 0), assert_context=False,
+            )
+            states.append(st); scenes.append(sc)
+            cams.append(cp); locs.append(lp); wlds.append(wp)
+        state_token = torch.cat(states, dim=1)            # (B, N, 384)
+        scene_token = torch.cat(scenes, dim=1)            # (B, N, 384)
+        camera_poses = torch.cat(cams, dim=1)             # (B, N, 5)
+        local_points = torch.cat(locs, dim=1)             # (B, N, H, W, 3)
+        world_points = torch.cat(wlds, dim=1)
+        return ([None, state_token, scene_token],
                 [camera_poses, local_points, world_points])
 
     # ----- Stage 3: single-frame streaming step ----------------------------

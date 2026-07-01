@@ -149,9 +149,19 @@ class LoGoPlannerTrainer(BaseTrainer):
             + (out['augment_critic_pred'] - inp['batch_augment_critic']).square().mean()
         )
 
-        pose_loss = (out['camera_poses_pred'] - inp['batch_gt_camera_poses']).square().mean()
-        local_loss = (out['local_points_pred'] - inp['batch_gt_local_points']).square().mean()
-        world_loss = (out['world_points_pred'] - inp['batch_gt_world_points']).square().mean()
+        # Geometry supervision. In streaming mode the backbone window has N frames
+        # (anchor + trajectory + window) while the dense geometry GT is only
+        # provided for the `context_size` reference frames, so shapes differ —
+        # skip the term (the frozen, pretrained LingBot backbone already carries
+        # geometry; per-window GT can be added later to re-enable Stage-1 here).
+        def _geo_mse(pred_key, gt_key):
+            pred, gt = out[pred_key], inp[gt_key]
+            if pred.shape != gt.shape:
+                return torch.zeros((), device=model_device)
+            return (pred - gt).square().mean()
+        pose_loss = _geo_mse('camera_poses_pred', 'batch_gt_camera_poses')
+        local_loss = _geo_mse('local_points_pred', 'batch_gt_local_points')
+        world_loss = _geo_mse('world_points_pred', 'batch_gt_world_points')
 
         subgoal_loss = (out['subgoal_pred'] - inp['batch_gt_subgoal']).square().mean()
 

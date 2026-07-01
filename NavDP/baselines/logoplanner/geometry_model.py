@@ -107,6 +107,43 @@ class GeometryModel(Pi3):
         scene_token = self.scene_compressor(scene_token).reshape(B, N, 384)
         return scene_token
     
+    def forward_goal(self, goal_img):
+        """Process a single goal image through the geometry backbone.
+
+        Shares fusion_head, GCA decoder, and camera_decoder with forward() so
+        Stage-1 geometry training simultaneously teaches the backbone to handle
+        goal images. A separate goal_pose_pred_mlp (in policy_network.py) then
+        maps the resulting features to a predicted goal pose.
+
+        Args:
+            goal_img: (B, H, W, 3) float in [0,1], same resolution as context frames.
+        Returns:
+            goal_dino_feat:    (B, hw, 1024) frozen ViT-L DINO features for retrieval.
+            goal_cam_hidden:   (B, hw, 512)  camera-decoded features for pose prediction
+                               (has gradient through the trainable GCA decoder in Stage 1).
+        """
+        B, H, W, _ = goal_img.shape
+        goal_bt = goal_img.unsqueeze(1)  # (B, 1, H, W, 3)
+
+        # Frozen ViT-L encoder — same as in forward_image (no_grad inside)
+        goal_dino_feat = self.forward_image(goal_bt)  # (B, hw, 1024)
+
+        # Depth prior: zeros for goal image (depth unavailable at inference)
+        dummy_depth = torch.zeros((B, 1, H, W, 1), dtype=torch.float32, device=self.device)
+        goal_depth_feat = self.forward_depth(dummy_depth)  # (B, hw, 384)
+
+        # Fuse image + depth features (trainable)
+        goal_metric = self.fusion_head(torch.cat([goal_dino_feat, goal_depth_feat], dim=-1))  # (B, hw, 1024)
+
+        # GCA decode with T=1 (trainable in Stage 1, frozen in Stage 2)
+        goal_hidden, goal_pos = self.decode(goal_metric, 1, H, W)  # (B, 269+, 2048)
+
+        # Camera decoder branch → features for pose prediction
+        goal_cam_hidden = self.camera_decoder(goal_hidden, xpos=goal_pos)  # (B, 269+, 512)
+        goal_cam_hidden = goal_cam_hidden[:, self.patch_start_idx:].float()  # (B, hw, 512)
+
+        return goal_dino_feat, goal_cam_hidden
+
     def forward(self, imgs, depths):
         B, N, H, W, _ = imgs.shape
         assert N == self.context_size

@@ -73,6 +73,10 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
         subgoal_dist=1.5,
         subgoal_turn_deg=30.0,
         subgoal_arrival=0.5,
+        streaming=False,
+        n_anchor=8,
+        n_traj=16,
+        n_window=64,
     ):
         super().__init__(
             root_dirs,
@@ -124,6 +128,19 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
         self.subgoal_turn_deg = float(subgoal_turn_deg)
         self.subgoal_arrival = float(subgoal_arrival)
         self._subgoal_cache = {}
+
+        # ---- Streaming GCT windows ----------------------------------------
+        # When streaming=True, the "context" window fed to the geometry backbone
+        # is the GCT layout [anchor (n_anchor) | trajectory keyframes (n_traj) |
+        # recent window (n_window)] with the decision frame LAST, instead of
+        # context_size consecutive frames. The window length N = n_anchor +
+        # n_traj + n_window replaces context_size for the geometry GT shapes too,
+        # so Stage-1 supervision (pose/local/world) lines up automatically.
+        self.streaming = streaming
+        self.n_anchor = int(n_anchor)
+        self.n_traj = int(n_traj)
+        self.n_window = int(n_window)
+        self.stream_window_len = self.n_anchor + self.n_traj + self.n_window
 
     # ---- Stage 4: subgoal generation ----
 
@@ -256,6 +273,50 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             rgb[slot] = self.process_context_image(rgb_paths[t])
             depth[slot] = self.process_context_depth(depth_paths[t])
             mask[slot] = True
+        return rgb, depth, mask, indices
+
+    def process_stream_window(self, rgb_paths, depth_paths, end_step, traj_len):
+        """Load a GCT streaming window ending at ``end_step`` (the decision frame).
+
+        Frame order (length ``N = n_anchor + n_traj + n_window``)::
+
+            [ anchor_0..n_anchor-1 | trajectory keyframes | recent window ]
+
+        * anchors  = the first ``n_anchor`` frames of the episode (scale frames),
+        * window   = the last ``n_window`` frames ending at ``end_step`` (stride 1),
+        * trajectory keyframes = ``n_traj`` frames evenly spaced between the anchor
+          block and the window (long-range memory). Degenerate / out-of-range
+          slots (very early in an episode) are zero-padded and marked invalid.
+
+        Returns ``(rgb, depth, mask, indices)`` with the same contract as
+        :meth:`process_context_window` so the geometry-GT path is unchanged.
+        """
+        n_a, n_t, n_w = self.n_anchor, self.n_traj, self.n_window
+        Hc, Wc = self.context_image_height, self.context_image_width
+
+        anchor_idx = np.arange(0, n_a)
+        window_idx = np.arange(end_step - n_w + 1, end_step + 1)
+        lo, hi = n_a, int(window_idx[0]) - 1  # exclusive of anchor block / window
+        if n_t > 0:
+            if hi >= lo:
+                traj_idx = np.linspace(lo, hi, n_t).round().astype(np.int64)
+            else:
+                # Episode prefix too short for a distinct trajectory region:
+                # collapse onto the window start (will be clipped/masked).
+                traj_idx = np.full(n_t, max(lo, 0), dtype=np.int64)
+        else:
+            traj_idx = np.zeros(0, dtype=np.int64)
+        indices = np.concatenate([anchor_idx, traj_idx, window_idx]).astype(np.int64)
+
+        N = indices.shape[0]
+        rgb = np.zeros((N, Hc, Wc, 3), np.float32)
+        depth = np.zeros((N, Hc, Wc, 1), np.float32)
+        mask = np.zeros((N,), np.bool_)
+        for slot, t in enumerate(indices):
+            if 0 <= t < traj_len and t < len(rgb_paths):
+                rgb[slot] = self.process_context_image(rgb_paths[t])
+                depth[slot] = self.process_context_depth(depth_paths[t])
+                mask[slot] = True
         return rgb, depth, mask, indices
 
     # ---- Memory loader override ----
@@ -458,11 +519,19 @@ class LoGoPlanner_Dataset(NavDP_Base_Datset):
             memory_digit=memory_digit,
         )
 
-        context_rgb, context_depth, context_mask, context_indices = self.process_context_window(
-            self.trajectory_rgb_path[index],
-            self.trajectory_depth_path[index],
-            memory_start_choice,
-        )
+        if self.streaming:
+            context_rgb, context_depth, context_mask, context_indices = self.process_stream_window(
+                self.trajectory_rgb_path[index],
+                self.trajectory_depth_path[index],
+                memory_start_choice,
+                trajectory_length,
+            )
+        else:
+            context_rgb, context_depth, context_mask, context_indices = self.process_context_window(
+                self.trajectory_rgb_path[index],
+                self.trajectory_depth_path[index],
+                memory_start_choice,
+            )
 
         (
             target_local_points,

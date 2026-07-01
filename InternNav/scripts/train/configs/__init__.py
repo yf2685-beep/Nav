@@ -7,6 +7,7 @@ from .navdp import navdp_exp_cfg
 from .logoplanner import logoplanner_exp_cfg
 from .logoplanner_stage1 import logoplanner_stage1_exp_cfg
 from .logoplanner_stage2 import logoplanner_stage2_exp_cfg
+from .logoplanner_streaming import logoplanner_streaming_exp_cfg
 
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     'logoplanner_exp_cfg',
     'logoplanner_stage1_exp_cfg',
     'logoplanner_stage2_exp_cfg',
+    'logoplanner_streaming_exp_cfg',
 ]

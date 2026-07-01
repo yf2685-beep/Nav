@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import cv2
@@ -5,6 +6,20 @@ from PIL import Image
 from matplotlib import colormaps as cm
 from policy_network import LoGoPlanner_Policy
 from collision_critic import obstacles_from_depth, rerank_trajectories
+
+# Stage 1: at inference the policy must be built with the SAME use_depth as the
+# checkpoint. RGB-only checkpoints have no depth_model; building use_depth=True
+# would add a randomly-initialised depth encoder and corrupt the trajectory.
+# Set USE_DEPTH=0 to load an RGB-only (Stage 1) checkpoint. Default True keeps
+# legacy RGB-D checkpoints working.
+_USE_DEPTH = os.environ.get('USE_DEPTH', '1') != '0'
+
+# Stage 4 (inference): feed the multi-stop model an in-distribution NEAR subgoal
+# (clamp the far goal to SUBGOAL_DIST metres) instead of the far final goal.
+# SUBGOAL_INFER=1 to enable; SUBGOAL_DIST sets the subgoal radius (default 1.5 m,
+# matching the training subgoal spacing).
+_SUBGOAL_INFER = os.environ.get('SUBGOAL_INFER', '0') == '1'
+_SUBGOAL_DIST = float(os.environ.get('SUBGOAL_DIST', '1.5'))
 
 class LoGoPlanner_Agent:
     def __init__(self,
@@ -37,7 +52,7 @@ class LoGoPlanner_Agent:
         self.safety_dist = safety_dist
         self.collision_threshold = collision_threshold
         self.safety_weight = safety_weight
-        self.navi_former = LoGoPlanner_Policy(image_size,memory_size,context_size,predict_size,temporal_depth,heads,token_dim,device)
+        self.navi_former = LoGoPlanner_Policy(image_size,memory_size,context_size,predict_size,temporal_depth,heads,token_dim,use_depth=_USE_DEPTH,device=device)
         # Trainer wraps the policy network in LoGoPlanner_Net (a `.policy` attribute),
         # so saved checkpoints have keys prefixed with `policy.`. Strip the prefix
         # before loading; otherwise strict=False silently drops every key and the
@@ -62,6 +77,10 @@ class LoGoPlanner_Agent:
         self.memory_queue = [[] for i in range(batch_size)]
         self.depth_queue = [[] for i in range(batch_size)]
         self.goal_queue = [[] for i in range(batch_size)]
+        # Streaming GCT: next step starts a fresh episode (clears KV cache +
+        # per-env token buffers inside the policy). Shared KV cache → all envs
+        # reset together (lock-step episodes).
+        self._stream_first = True
 
     def reset_env(self,i):
         self.memory_queue[i] = []
@@ -149,6 +168,22 @@ class LoGoPlanner_Agent:
     def process_pointgoal(self,goals):
         clip_goals = goals.clip(-10,10)
         clip_goals[:,0] = np.clip(clip_goals[:,0],0,10)
+        # Stage 4 (inference): the multi-stop model was TRAINED on nearby subgoals
+        # (<= subgoal_dist). At eval the env hands us the FAR final goal, which is
+        # out-of-distribution. Clamp the goal vector to the subgoal radius along the
+        # SAME direction → feed an in-distribution subgoal. As the robot advances,
+        # the goal vector shrinks; once within subgoal_dist we feed the true goal.
+        # Heading is set to the bearing toward the subgoal. Env-gated (default off).
+        if _SUBGOAL_INFER:
+            xy = clip_goals[:, 0:2]
+            d = np.linalg.norm(xy, axis=-1, keepdims=True)
+            far = (d[:, 0] > _SUBGOAL_DIST)
+            scale = np.where(d[:, 0:1] > 1e-6, _SUBGOAL_DIST / np.maximum(d, 1e-6), 0.0)
+            sub_xy = np.where(far[:, None], xy * scale, xy)
+            clip_goals = clip_goals.copy()
+            clip_goals[:, 0:2] = sub_xy
+            # face the subgoal: theta = atan2(y, x)
+            clip_goals[:, 2] = np.where(far, np.arctan2(sub_xy[:, 1], sub_xy[:, 0]), clip_goals[:, 2])
         return clip_goals
     
     def step_nogoal(self,images,depths):
@@ -226,6 +261,14 @@ class LoGoPlanner_Agent:
     def step_pointgoal(self,goals,images,depths):
         process_images = self.process_image(images)
         process_depths = self.process_depth(depths)
+
+        # ---- Streaming GCT path (LOGO_STREAMING=1) --------------------------
+        # Feed the single current frame through the backbone's persistent KV
+        # cache (anchor 8 + window 64 + trajectory memory) instead of crushing
+        # the whole episode into 12 subsampled frames every step.
+        if getattr(self.navi_former, '_streaming', False):
+            return self._step_pointgoal_stream(goals, images, process_images, process_depths)
+
         memory_rgbds = []
         context_rgbds = []
         for i in range(len(self.memory_queue)): # envs
@@ -272,6 +315,45 @@ class LoGoPlanner_Agent:
         if self.use_critic_rerank:
             # Stage 6: geometric collision reranking over the diffusion candidates.
             # all_trajectory: (B, K, T, 3); pick per-env the safest-toward-subgoal one.
+            chosen = self._rerank_pointgoal(all_trajectory, all_values, goals, process_depths)
+        return chosen, all_trajectory, all_values, trajectory_mask, sub_pointgoal_pd
+
+    def _step_pointgoal_stream(self, goals, images, process_images, process_depths):
+        """One streaming decision step: push the current frame, assemble the GCT
+        summary over the whole episode so far, and run the diffusion policy."""
+        imgs = np.asarray(process_images, np.float32)          # (B, H, W, 3) in [0,1]
+        deps = np.asarray(process_depths, np.float32)          # (B, H, W, 1) meters
+        if deps.ndim == 3:
+            deps = deps[..., None]
+        deps[..., 0][deps[..., 0] > 5.0] = 0
+        deps[..., 0][deps[..., 0] < 0.1] = 0
+
+        image_t = torch.as_tensor(imgs, dtype=torch.float32, device=self.device)
+        depth_t = torch.as_tensor(deps, dtype=torch.float32, device=self.device)
+
+        episode_start = bool(getattr(self, '_stream_first', True))
+        self._stream_first = False
+
+        # Multi-stop long-route navigation: the model was trained on NEARBY subgoals
+        # (~subgoal_dist m), so feeding the far final goal (~6 m, OOD) makes it wander.
+        # process_pointgoal (SUBGOAL_INFER=1) clamps the far goal to a subgoal_dist-m
+        # waypoint along the SAME bearing; as the robot advances the vector shrinks,
+        # so it chains subgoal→subgoal until within subgoal_dist of the true goal.
+        start_goal = self.process_pointgoal(np.asarray(goals, dtype=np.float32))
+        all_trajectory, all_values, good_trajectory, bad_trajectory, sub_pointgoal_pd = (
+            self.navi_former.predict_pointgoal_action_stream(
+                start_goal, image_t, depth_t, episode_start=episode_start,
+            )
+        )
+        if all_values.max() < self.stop_threshold:
+            good_trajectory[:, :, :, 0] = good_trajectory[:, :, :, 0] * 0.0
+            good_trajectory[:, :, :, 1] = np.sign(good_trajectory[:, :, :, 1].mean())
+
+        print(all_values.max(), all_values.min())
+        trajectory_mask = self.project_trajectory(images, all_trajectory, all_values)
+
+        chosen = good_trajectory[:, 0]
+        if self.use_critic_rerank:
             chosen = self._rerank_pointgoal(all_trajectory, all_values, goals, process_depths)
         return chosen, all_trajectory, all_values, trajectory_mask, sub_pointgoal_pd
 
