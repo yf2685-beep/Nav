@@ -257,10 +257,22 @@ class MemNavNet(nn.Module):
         )
 
     @torch.no_grad()
-    def _load_cache(self, path):
+    def _load_cache(self, path, rgb_dir):
+        """Assemble the KV cache dict from disk. If the npz lacks
+        ``scale_k/scale_v`` (--skip_scale precompute mode), compute it on the
+        fly from the first ``num_scale`` RGB frames of ``rgb_dir`` — bf16 output,
+        LRU-cached per trajectory inside LingBotStream."""
         c = np.load(path)
-        sk, sv, ak, av = LingBotStream._cache_to_layered(
-            c["scale_k"], c["scale_v"], c["anchor_k"], c["anchor_v"], self.device)
+        keys = set(c.files)
+        if "scale_k" in keys and "scale_v" in keys:
+            sk, sv, ak, av = LingBotStream._cache_to_layered(
+                c["scale_k"], c["scale_v"], c["anchor_k"], c["anchor_v"], self.device)
+        else:
+            sk, sv = self.lingbot.get_scale_kv(rgb_dir)
+            ak = torch.as_tensor(c["anchor_k"], device=self.device, dtype=torch.bfloat16)\
+                .permute(1, 2, 0, 3, 4).contiguous()
+            av = torch.as_tensor(c["anchor_v"], device=self.device, dtype=torch.bfloat16)\
+                .permute(1, 2, 0, 3, 4).contiguous()
         cc = np.load(path.replace("lingbot_cache.npz", "lingbot_cam_cache.npz"))
         ck, cv = LingBotStream._cam_to_device(cc["cam_k"], cc["cam_v"], self.device)
         return dict(scale_k=sk, scale_v=sv, anchor_k=ak, anchor_v=av, cam_k=ck, cam_v=cv)
@@ -286,7 +298,7 @@ class MemNavNet(nn.Module):
             goal_img = batch["batch_goal_image"][b].to(dev)
             win_img = batch["batch_window_images"][b].to(dev)
             with torch.no_grad():
-                cache = self._load_cache(batch["cache_paths"][b])
+                cache = self._load_cache(batch["cache_paths"][b], rgb_dir)
                 ck, cv = cache["cam_k"], cache["cam_v"]
                 # (1) current state: post-GCT tokens + depth-head geometry + pose feature
                 #  wt: window tokens [W, P, 2C], cur_agg: current frame's multi-layer agg, psi: patch_start_idx

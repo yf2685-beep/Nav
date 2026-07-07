@@ -29,9 +29,12 @@ if REPO not in sys.path:
 
 from internnav.model.basemodel.memnav.lingbot_stream import LingBotStream
 
-RGB_DIR = ("/home/asus/Research/datasets/InternData-N1/vln_n1/traj_data/"
-           "matterport3d_d435i/17DRP5sb8fy/trajectory_89/videos/chunk-000/"
-           "observation.images.rgb")
+RGB_DIR = os.environ.get(
+    "VALIDATE_RGB_DIR",
+    "/scratch/lg154/Research/datasets/InternData-N1/vln_n1/_raw/"
+    "matterport3d_d435i/17DRP5sb8fy/trajectory_10/videos/chunk-000/"
+    "observation.images.rgb",
+)
 N = 14   # total frames to stream (scale block + a few streaming frames)
 
 

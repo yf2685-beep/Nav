@@ -28,18 +28,25 @@ FROZEN for v1: ``eval()`` + ``requires_grad_(False)`` + ``no_grad`` calls. Throu
 time fine-tuning (flip the no_grad) is a later phase.
 """
 
+import os
 import sys
+from collections import OrderedDict
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+_DEFAULT_LINGBOT_REPO = "/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map"
+_DEFAULT_LINGBOT_WEIGHTS = (
+    "/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map/weights/lingbot-map-long.pt"
+)
+
 
 class LingBotStream(nn.Module):
     def __init__(
         self,
-        lingbot_repo="/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map",
-        weights="/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map/weights/lingbot-map-long.pt",
+        lingbot_repo=None,
+        weights=None,
         img_size=518,
         patch_size=14,
         num_scale=8,
@@ -49,12 +56,22 @@ class LingBotStream(nn.Module):
         camera_num_iterations=4,
         use_sdpa=True,
         device="cuda",
+        scale_lru_size=4,
     ):
         super().__init__()
         self.device = device
         self.num_scale = num_scale
         self.window = window
         self.num_special = 1 + 4 + 1  # camera + 4 register + scale  (patch_start_idx)
+        # LRU of on-the-fly-computed scale KV, keyed by rgb_dir. Each entry is
+        # (scale_k, scale_v) bf16 on device, ~1.08 GB — keep the cap small.
+        self._scale_lru_size = int(scale_lru_size)
+        self._scale_lru: "OrderedDict[str, tuple]" = OrderedDict()
+
+        if lingbot_repo is None:
+            lingbot_repo = os.environ.get("LINGBOT_REPO", _DEFAULT_LINGBOT_REPO)
+        if weights is None:
+            weights = os.environ.get("LINGBOT_WEIGHTS", _DEFAULT_LINGBOT_WEIGHTS)
 
         if lingbot_repo not in sys.path:
             sys.path.insert(0, lingbot_repo)
@@ -72,9 +89,15 @@ class LingBotStream(nn.Module):
             use_sdpa=use_sdpa, camera_num_iterations=camera_num_iterations,
         )
         if weights:
-            ckpt = torch.load(weights, map_location=device, weights_only=False)
+            # Load to CPU first, then move to device — on some CUDA/driver combos
+            # (observed on H100 + torch 2.8+cu128), map_location=cuda inflates
+            # transient host RSS wildly during pickle deserialize.
+            ckpt = torch.load(weights, map_location="cpu", weights_only=False)
             sd = ckpt.get("model", ckpt)
             missing, unexpected = self.model.load_state_dict(sd, strict=False)
+            del ckpt, sd
+            import gc
+            gc.collect()
             print(f"[LingBotStream] weights: {len(missing)} missing, {len(unexpected)} unexpected")
         self.model = self.model.to(device).eval()
         for p in self.model.parameters():
@@ -183,6 +206,57 @@ class LingBotStream(nn.Module):
         ak = torch.as_tensor(anchor_k, device=device, dtype=torch.bfloat16).permute(1, 2, 0, 3, 4).contiguous()
         av = torch.as_tensor(anchor_v, device=device, dtype=torch.bfloat16).permute(1, 2, 0, 3, 4).contiguous()
         return sk, sv, ak, av
+
+    # ------------------------------------------------------------------ #
+    # on-the-fly scale KV (skip storing scale_k/v on disk)
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def compute_scale_kv(self, rgb_paths):
+        """Compute scale_k/v [L, H, num_scale, P, d] on the fly from the first
+        ``num_scale`` RGB frames of a trajectory.  Mirrors Phase 1 of
+        ``precompute_lingbot_features.extract_trajectory`` (single bidirectional
+        block of scale frames), so the result matches the on-disk ``scale_k/v``
+        up to fp16↔bf16 storage rounding.
+
+          rgb_paths : list of at least ``num_scale`` paths — only the first
+                      ``num_scale`` are used.
+        Returns (scale_k, scale_v) bf16 on device — same shape/dtype as
+        :meth:`_cache_to_layered` produces from the on-disk arrays."""
+        scale = self.num_scale
+        imgs = self._preprocess(
+            rgb_paths[:scale], mode="pad",
+            image_size=self.img_size, patch_size=self.patch_size,
+        ).unsqueeze(0).to(self.device)                        # [1, scale, 3, H, W]
+
+        self.model.clean_kv_cache()
+        kv = self.agg.kv_cache
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            self.model._aggregate_features(
+                imgs, num_frame_for_scale=scale, num_frame_per_block=scale,
+            )
+        sk = torch.stack([kv[f"k_{i}"][0, :, :scale].to(torch.bfloat16)
+                          for i in range(self.depth)]).contiguous()
+        sv = torch.stack([kv[f"v_{i}"][0, :, :scale].to(torch.bfloat16)
+                          for i in range(self.depth)]).contiguous()
+        self.model.clean_kv_cache()
+        return sk, sv
+
+    def get_scale_kv(self, rgb_dir):
+        """LRU-cached :meth:`compute_scale_kv` keyed by ``rgb_dir`` (trajectory
+        identity).  Trains at ~O(#samples-per-traj) recomputes per traj instead
+        of one per sample — an 8-frame GCT forward is ~200–400 ms on H100 so
+        even LRU=1 is fine; larger caps just help when many samples of the same
+        traj land in the same worker in a short window."""
+        entry = self._scale_lru.get(rgb_dir)
+        if entry is not None:
+            self._scale_lru.move_to_end(rgb_dir)
+            return entry
+        paths = [os.path.join(rgb_dir, f"{i}.jpg") for i in range(self.num_scale)]
+        sk, sv = self.compute_scale_kv(paths)
+        self._scale_lru[rgb_dir] = (sk, sv)
+        while len(self._scale_lru) > self._scale_lru_size:
+            self._scale_lru.popitem(last=False)
+        return sk, sv
 
     # ------------------------------------------------------------------ #
     # window-forward: current post-GCA state

@@ -114,7 +114,7 @@ def build_model(args, device):
 # Per-trajectory KV-cache + CLS capture
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False):
+def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False, skip_scale=False):
     """Stream `images` [1, S, 3, H, W] through the aggregator + camera head,
     capturing per-frame KV caches (and the DINOv2 CLS token).
 
@@ -179,7 +179,8 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     ck, cv = read_cam_newest(scale); cam_k_list.append(ck); cam_v_list.append(cv)
     if not cam_only:
         cls_list.append(pop_cls(scale))
-        scale_k, scale_v = read_cache_full(slice(0, scale))      # [L,H,scale,P,d]
+        if not skip_scale:
+            scale_k, scale_v = read_cache_full(slice(0, scale))  # [L,H,scale,P,d]
 
     # Phase 2: causal streaming, one frame at a time.
     anchor_k_list, anchor_v_list = [], []
@@ -211,10 +212,12 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
         anchor_v = np.zeros((0, L, Hh, psi, d), np.float16)
     out.update({
         "dino_cls": torch.cat(cls_list, dim=0).numpy(),          # [S, D']
-        "scale_k": scale_k.numpy(), "scale_v": scale_v.numpy(),  # [L, H, scale, P, d]
         "anchor_k": anchor_k, "anchor_v": anchor_v,              # [S-scale, L, H, psi, d]
         "meta": np.array([scale, psi, L, Hh, d], dtype=np.int64),
     })
+    if not skip_scale:
+        out["scale_k"] = scale_k.numpy()                          # [L, H, scale, P, d]
+        out["scale_v"] = scale_v.numpy()
     return out
 
 
@@ -246,10 +249,18 @@ def main():
                     help="Camera-head KV cache filename (cam_k/cam_v/cam_meta).")
     ap.add_argument("--cam_only", action="store_true",
                     help="Capture ONLY the camera-head cache (keep the existing aggregator npz untouched).")
+    ap.add_argument("--skip_scale", action="store_true",
+                    help="Skip writing scale_k/scale_v (~1.08 GB/traj). Training recomputes them "
+                         "on the fly from the first num_scale RGB frames via "
+                         "LingBotStream.get_scale_kv (LRU-cached).")
     ap.add_argument("--overwrite", action="store_true",
                     help="Recompute even if the output npz already exists.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Process at most N trajectories (0 = all). For smoke tests.")
+    ap.add_argument("--num_shards", type=int, default=1,
+                    help="Divide the traj list into this many interleaved shards.")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="Which shard [0, num_shards) to process. Combine with SLURM array to parallelize.")
     ap.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
     args = ap.parse_args()
 
@@ -271,9 +282,14 @@ def main():
     handle = model.aggregator.patch_embed.register_forward_hook(hook)
 
     trajectories = find_trajectories(args.root_dirs)
+    total = len(trajectories)
+    if args.num_shards > 1:
+        assert 0 <= args.shard < args.num_shards, f"--shard {args.shard} out of [0, {args.num_shards})"
+        trajectories = trajectories[args.shard::args.num_shards]  # interleaved for load balance
     if args.limit:
         trajectories = trajectories[:args.limit]
-    print(f"Found {len(trajectories)} trajectories under {args.root_dirs}")
+    print(f"Found {total} trajectories under {args.root_dirs}; "
+          f"processing {len(trajectories)} on shard {args.shard}/{args.num_shards}")
 
     n_done, n_skip, n_err = 0, 0, 0
     for traj_dir, rgb_dir, rgb_paths in tqdm(trajectories, desc="trajectories"):
@@ -294,21 +310,24 @@ def main():
             images = images.unsqueeze(0)  # [1, N, 3, H, W]
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(args.dtype != "fp32")):
                 feats = extract_trajectory(
-                    model, images, args.num_scale_frames, dino_capture, cam_only=args.cam_only
+                    model, images, args.num_scale_frames, dino_capture,
+                    cam_only=args.cam_only, skip_scale=args.skip_scale,
                 )
             assert np.isfinite(feats["cam_k"]).all(), "non-finite cam_k"
             # Camera-head cache (always) — small; np.savez (ZIP_STORED) avoids slow deflate.
             np.savez(cam_path, cam_k=feats["cam_k"], cam_v=feats["cam_v"], cam_meta=feats["cam_meta"])
             if not args.cam_only:
                 assert np.isfinite(feats["dino_cls"]).all(), "non-finite dino_cls"
-                assert np.isfinite(feats["scale_k"]).all(), "non-finite scale_k"
-                np.savez(
-                    out_path,
+                save_kwargs = dict(
                     dino_cls=feats["dino_cls"].astype(np.float16),
-                    scale_k=feats["scale_k"], scale_v=feats["scale_v"],
                     anchor_k=feats["anchor_k"], anchor_v=feats["anchor_v"],
                     meta=feats["meta"],
                 )
+                if not args.skip_scale:
+                    assert np.isfinite(feats["scale_k"]).all(), "non-finite scale_k"
+                    save_kwargs["scale_k"] = feats["scale_k"]
+                    save_kwargs["scale_v"] = feats["scale_v"]
+                np.savez(out_path, **save_kwargs)
             n_done += 1
         except Exception as e:  # noqa: BLE001 — keep going, report at the end
             n_err += 1

@@ -70,6 +70,36 @@ class MemNavTrainer(BaseTrainer):
                   f"retr={retrieval_loss.item():.4f}(acc {ret_acc.item():.2f}) aux={aux_loss.item():.4f} | "
                   f"gate seen={gate_seen.item():.2f} unseen={gate_unseen.item():.2f} sep={gate_sep.item():+.2f} | "
                   f"match seen={seen_match.item():.2f} unseen_null={unseen_null.item():.2f}")
+
+        # Per-component metrics → wandb/tb. self.log is rank-0-only inside HF Trainer;
+        # gate by logging_steps to match train/loss cadence and avoid extra .item() syncs.
+        if self.state.global_step % self.args.logging_steps == 0:
+            log_payload = {
+                'train/action_loss': action_loss.item(),
+                'train/ng_loss': ng_loss.item(),
+                'train/mg_loss': mg_loss.item(),
+                'train/retrieval_loss': retrieval_loss.item(),
+                'train/aux_loss': aux_loss.item(),
+                'train/ret_acc': ret_acc.item(),
+                'train/gate_seen': gate_seen.item(),
+                'train/gate_unseen': gate_unseen.item(),
+                'train/gate_sep': gate_sep.item(),
+                'train/seen_match_acc': seen_match.item(),
+                'train/unseen_null_acc': unseen_null.item(),
+            }
+            if dev.type == 'cuda':
+                # Peak since previous logging_step, in GiB. Reset right after so the
+                # next window measures its own peak — otherwise max_ stays monotone.
+                alloc = torch.cuda.max_memory_allocated(dev) / 2**30
+                reserved = torch.cuda.max_memory_reserved(dev) / 2**30
+                log_payload['train/mem_alloc_gb'] = alloc
+                log_payload['train/mem_reserved_gb'] = reserved
+                if (dist.get_rank() if dist.is_initialized() else 0) == 0:
+                    print(f"[Step {self.state.global_step}] mem peak "
+                          f"alloc={alloc:.2f}GiB reserved={reserved:.2f}GiB")
+                torch.cuda.reset_peak_memory_stats(dev)
+            self.log(log_payload)
+
         return (loss, outputs) if return_outputs else loss
 
     # ------------------------------------------------------------------ #

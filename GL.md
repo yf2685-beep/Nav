@@ -86,7 +86,21 @@ Data loader is complete and validated:
 | `decoder` | NavDP DDPM, ng/mg; no critic (geometric collision at eval) |
 
 
+## Choices on Dataset
 
+NavDP (2505.08712) 
+- 3,154 scenes from 6 sources: 3D-Front, HSSD, HM3D, Replica, Gibson, Matterport3D
+- 200K trajectories, 40M images, 1627 km, 452 hours
+- Per scene: 100 start-goal pairs sampled via A* -> greedy -> cubic spline
+- Rendered with BlenderProc (photorealistic RGB-D)
+- Augmentation: light + view + texture randomization
+
+LoGoPlanner (2512.19629) - same InternData-N1
+- Same "over 200k trajectories, ~10M rendered images"
+- Cross-embodiment via randomization: robot height [0.25 m, 1.25 m], camera pitch: [0, 30]
+- Two-stage training:
+  - Stage 1 (geometry backbone + task heads): batch=12, 24 hrs
+  - Stage 2 (diffusion head + task heads, backbone frozen): batch=32, 3 days
 
 ## 1. Dataset
 

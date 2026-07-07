@@ -1,7 +1,24 @@
+import os
+
 from internnav.configs.model.memnav import memnav_cfg
 from internnav.configs.trainer.eval import EvalCfg
 from internnav.configs.trainer.exp import ExpCfg
 from internnav.configs.trainer.il import IlCfg
+
+# HPC-friendly defaults: env vars override the developer-desktop paths so a
+# SLURM job only needs `export MEMNAV_ROOT_DIR / LINGBOT_REPO / LINGBOT_WEIGHTS`.
+_ROOT_DIR = os.environ.get(
+    'MEMNAV_ROOT_DIR',
+    '/home/asus/Research/datasets/InternData-N1/vln_n1/traj_data',
+)
+_LINGBOT_REPO = os.environ.get(
+    'LINGBOT_REPO',
+    '/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map',
+)
+_LINGBOT_WEIGHTS = os.environ.get(
+    'LINGBOT_WEIGHTS',
+    '/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map/weights/lingbot-map-long.pt',
+)
 
 memnav_exp_cfg = ExpCfg(
     name='memnav_train',
@@ -36,11 +53,11 @@ memnav_exp_cfg = ExpCfg(
         save_filter_frozen_weights=True,
         load_from_ckpt=False,
         ckpt_to_load='',
-        report_to='tensorboard',
-        # data + frozen-LingBot paths  (OVERRIDE THESE ON HPC)
-        root_dir='/home/asus/Research/datasets/InternData-N1/vln_n1/traj_data',
-        lingbot_repo='/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map',
-        lingbot_weights='/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map/weights/lingbot-map-long.pt',
+        report_to=os.environ.get('MEMNAV_REPORT_TO', 'wandb'),
+        # data + frozen-LingBot paths (override via MEMNAV_ROOT_DIR / LINGBOT_REPO / LINGBOT_WEIGHTS)
+        root_dir=_ROOT_DIR,
+        lingbot_repo=_LINGBOT_REPO,
+        lingbot_weights=_LINGBOT_WEIGHTS,
         image_size=518,
         random_digit=False,
         # policy / diffusion
