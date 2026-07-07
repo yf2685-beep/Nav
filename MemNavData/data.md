@@ -39,3 +39,29 @@ Controller:
 - pure-pursuit-style controller
 
 
+### Sampling B and C
+
+**Episode structure**
+
+- 2-leg: `start → A → B`
+- 3-leg: `start → A → B → C`
+
+`A` is always the fresh outbound goal: a random navigable point that fixes the episode's floor (`floor_y = A.y`) and has clearance ≥ `r_min` (0.4 m). Every other waypoint is constrained to A's floor.
+
+**Procedure (per goal B, and again for C)**
+
+1. **Anchor frame.** Pick a random leg-A frame `X` with index ≥ `--anchor_margin` (15 = `num_scale + window − 1`), the earliest index with a valid match window behind it.
+2. **Position.** Sample uniformly in a disk of radius `--goal_jitter_pos` (1.5 m) around `X`'s position; snap to the navmesh; reject on clearance and floor. For C, additionally require geodesic distance from B ≥ `c_min`.
+3. **Heading.** Sample within a ± `--head_max_deg` (45°) cone around `X`'s heading.
+4. **Covisibility gate.** Accept only if covis ∈ [0.2, 1.0] (max over history) **and** heading offset ≤ 45° relative to the covisibility-matched frame.
+
+Note that `X` is the *sampling* anchor, not necessarily the best match — the position jitter means some other history frame may be more covisible with the placed goal. The gate is therefore evaluated against the best-covisibility frame over history, not against `X`.
+
+### Labeling the matching frame
+
+A goal has a *set* of acceptable matching frames, not a single one, so we don't store a hard match label. Instead, each goal's metadata records:
+
+- `covis_curve` — covisibility of the goal against every history frame;
+- `covis_argmax` — the index of the best-matching frame.
+
+Positive vs. negative is then derived at train time by thresholding `covis_curve`: frames above the positive threshold form the positive set, frames below the negative threshold are negatives, and the band between is ignored. Storing the full curve rather than a binary label keeps the threshold a tunable knob and lets the same data support the contrastive loss (one sampled positive, masked negatives) without regeneration.

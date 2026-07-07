@@ -338,6 +338,14 @@ def max_covis(goal_pts_world, poses, depths, stride=4, tol=0.3):
     return best, bi
 
 
+def covis_curve(goal_pts_world, poses, depths, tol=0.3):
+    """Occlusion-aware co-visibility of a goal view vs EVERY history frame (stride 1). Index i
+    aligns with global frame i (history = legs concatenated in order). This is the multi-positive
+    retrieval label: the loader thresholds it into positives (>=pos_hi) / negatives (<=pos_lo) /
+    ignore-band, and its argmax is the relocalization anchor."""
+    return np.array([covis_frac(goal_pts_world, poses[i], depths[i], tol) for i in range(len(poses))], float)
+
+
 def save_traj(out_dir, rgbs, depths, poses_hab, meta, goal_rgbs):
     import pandas as pd
     rgb_d = os.path.join(out_dir, "videos/chunk-000/observation.images.rgb")
@@ -426,22 +434,23 @@ def _render_leg(sim, frames):
     return poses, depths, rgbs
 
 
-def sample_revisit(sim, pf, leg1_frames, hist_poses, hist_depths, rng, args, ch,
+def sample_revisit(sim, pf, hist_frames, hist_poses, hist_depths, n_anchor, rng, args, ch,
                    floor_y, source=None, min_geo=0.0):
-    """A perturbed REVISIT goal, ANCHOR-CENTRIC (same parameterisation as revisit_sweep_gen):
-      1. pick a random leg-A anchor frame X (in the valid match range >= anchor_margin);
+    """A perturbed REVISIT goal, ANCHOR-CENTRIC (same parameterisation as revisit_sweep_gen).
+    hist_frames/poses/depths cover the FULL history the retrieval head sees at this goal's step
+    (leg1 for B; leg1+leg2 for C); n_anchor = #leading frames that ARE the revisit target (leg1),
+    so leg2 frames become hard NEGATIVES for C but are never sampled as the anchor.
+      1. pick a random anchor frame X from the target leg ([anchor_margin, n_anchor));
       2. sample B position in a UNIFORM DISK of radius goal_jitter_pos around X, snapped to navmesh;
-      3. sample B heading in a +/- head_max_deg CONE around X's heading (so the heading offset is
-         bounded by construction);
-      4. render B, gate on covis in [covis_lo, covis_hi] (max over history) AND heading offset vs the
-         co-visibility-MATCHED frame <= head_max_deg (ensures the best-match anchor is relocalizable).
-    Returns (pos_floor_habitat, goal_yaw, covis, matched_frame, head_off_deg) or None."""
-    n = len(leg1_frames)
-    lo = min(args.anchor_margin, max(0, n - 1))
+      3. sample B heading in a +/- head_max_deg CONE around X's heading;
+      4. cheap stride gate on covis in [covis_lo, covis_hi]; on pass, compute the stride-1 covisibility
+         curve over EVERY history frame -> argmax = GT relocalization anchor, curve = multi-positive label.
+    Returns (pos, goal_yaw, covis, matched_frame, head_off_deg, covis_curve) or None."""
+    lo = min(args.anchor_margin, max(0, n_anchor - 1))
     R = args.goal_jitter_pos
     for _ in range(args.goal_tries):
-        xi = int(rng.integers(lo, n)) if n > lo else int(rng.integers(0, n))
-        Xp = leg1_frames[xi][0]; Xyaw = float(leg1_frames[xi][1])
+        xi = int(rng.integers(lo, n_anchor)) if n_anchor > lo else int(rng.integers(0, n_anchor))
+        Xp = hist_frames[xi][0]; Xyaw = float(hist_frames[xi][1])
         r = R * np.sqrt(rng.uniform()); th = rng.uniform(0, 2 * np.pi)      # uniform in the disk
         p = np.array(pf.snap_point([float(Xp[0] + r * np.cos(th)), floor_y, float(Xp[2] + r * np.sin(th))]), float)
         if not _clear(pf, p, args.r_min) or not _on_floor(p, floor_y, args.floor_tol):
@@ -451,19 +460,25 @@ def sample_revisit(sim, pf, leg1_frames, hist_poses, hist_depths, rng, args, ch,
             if not ok or gd < min_geo:
                 continue
         gyaw = Xyaw + np.deg2rad(rng.uniform(-args.head_max_deg, args.head_max_deg))   # cone around X
-        cov, ai = max_covis(_goal_world_pts(sim, p, gyaw, ch), hist_poses, hist_depths,
-                            stride=args.covis_stride, tol=args.covis_tol)
-        if not (args.covis_lo <= cov <= args.covis_hi):
+        gpts = _goal_world_pts(sim, p, gyaw, ch)
+        cov, _ = max_covis(gpts, hist_poses, hist_depths, stride=args.covis_stride, tol=args.covis_tol)
+        if not (args.covis_lo <= cov <= args.covis_hi):          # cheap subsampled GATE (reject fast)
             continue
-        head_off = abs((gyaw - leg1_frames[ai][1] + np.pi) % (2 * np.pi) - np.pi)       # vs matched frame
-        if head_off <= np.deg2rad(args.head_max_deg):
-            return p, float(gyaw), float(cov), int(ai), float(np.degrees(head_off))
+        # On accept, the true label is the FULL stride-1 covisibility curve over every history frame:
+        # position jitter means the sampling anchor X is not necessarily the best match, so the GT
+        # matched frame is the curve argmax (relocalization anchor) and the curve is the retrieval label.
+        curve = covis_curve(gpts, hist_poses, hist_depths, tol=args.covis_tol)
+        ai = int(curve.argmax()); cov = float(curve[ai])
+        head_off = abs((gyaw - hist_frames[ai][1] + np.pi) % (2 * np.pi) - np.pi)       # vs GT matched frame
+        if (args.covis_lo <= cov <= args.covis_hi) and head_off <= np.deg2rad(args.head_max_deg):
+            return p, float(gyaw), float(cov), int(ai), float(np.degrees(head_off)), curve
     return None
 
 
 def sample_novel(sim, pf, A, hist_poses, hist_depths, rng, args, ch, floor_y):
     """A NOVEL goal: on THIS floor, navigable, clearance>=r_min, geodesic(A,.)>min_dist_AB, and
-    max co-visibility with history < novel_covis. Returns (pos_floor, goal_yaw, covis)."""
+    max co-visibility with history < novel_covis (retrieval target = null -> all frames negative).
+    Returns (pos_floor, goal_yaw, covis, covis_curve) or None."""
     for _ in range(args.goal_tries):
         p = np.array(pf.get_random_navigable_point(), float)
         if not _clear(pf, p, args.r_min) or not _on_floor(p, floor_y, args.floor_tol):
@@ -472,10 +487,15 @@ def sample_novel(sim, pf, A, hist_poses, hist_depths, rng, args, ch, floor_y):
         if not ok or gd < args.min_dist_AB:
             continue
         gyaw = yaw_facing((p - np.asarray(A, float))[[0, 2]])   # view along the approach
-        cov, _ai = max_covis(_goal_world_pts(sim, p, gyaw, ch), hist_poses, hist_depths,
-                             stride=args.covis_stride, tol=args.covis_tol)
-        if cov < args.novel_covis:
-            return p, float(gyaw), float(cov)
+        gpts = _goal_world_pts(sim, p, gyaw, ch)
+        cov, _ai = max_covis(gpts, hist_poses, hist_depths, stride=args.covis_stride, tol=args.covis_tol)
+        if cov >= args.novel_covis:                              # cheap subsampled reject
+            continue
+        # confirm genuinely unseen over EVERY frame: the stride gate can SKIP the one frame that
+        # observed p and wrongly call it novel. The full curve doubles as the (all-negative) label.
+        curve = covis_curve(gpts, hist_poses, hist_depths, tol=args.covis_tol)
+        if float(curve.max()) < args.novel_covis:
+            return p, float(gyaw), float(curve.max()), curve
     return None
 
 
@@ -541,16 +561,17 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
         p1, d1, r1 = _render_leg(sim, leg1)
 
         # --- B: 2-leg -> REVISIT on leg A ; 3-leg -> NOVEL (off leg A) ---
+        # history at B's step = leg1 (n_anchor = all of leg1: the revisit target).
         if args.n_legs == 2:
-            rv = sample_revisit(sim, pf, leg1, p1, d1, rng, args, ch, floor_y)
+            rv = sample_revisit(sim, pf, leg1, p1, d1, len(leg1), rng, args, ch, floor_y)
             if rv is None:
                 continue
-            B, yaw_B, covB, aiB, hoB = rv; kindB = "revisit"; arriveB = True
+            B, yaw_B, covB, aiB, hoB, curveB = rv; kindB = "revisit"; arriveB = True
         else:
             nv = sample_novel(sim, pf, A, p1, d1, rng, args, ch, floor_y)
             if nv is None:
                 continue
-            B, yaw_B, covB = nv; aiB = -1; hoB = None; kindB = "novel"; arriveB = False
+            B, yaw_B, covB, curveB = nv; aiB = -1; hoB = None; kindB = "novel"; arriveB = False
         okB, gdB, g2 = geodesic(pf, A, B)
         if not okB or gdB < args.b_min or not _geo_on_floor(g2, floor_y, ftol):
             continue
@@ -560,14 +581,18 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
             continue
         p2, d2, r2 = _render_leg(sim, leg2)
         legs = [leg1, leg2]; R = [(p1, d1, r1), (p2, d2, r2)]
-        goals = [dict(name="B", pos=B, yaw=yaw_B, kind=kindB, covis=covB, covis_argmax=aiB, head_off_deg=hoB)]
+        goals = [dict(name="B", pos=B, yaw=yaw_B, kind=kindB, covis=covB, covis_argmax=aiB,
+                      head_off_deg=hoB, covis_curve=curveB)]
 
-        # --- 3-leg: C REVISITS leg A (leg1), reached from B ---
+        # --- 3-leg: C REVISITS leg A (leg1), reached from B. History at C's step = leg1+leg2, so leg2
+        #     frames are hard NEGATIVES; anchor is still sampled from leg1 (n_anchor = len(leg1)). ---
         if args.n_legs >= 3:
-            rv = sample_revisit(sim, pf, leg1, p1, d1, rng, args, ch, floor_y, source=B, min_geo=args.c_min)
+            hist_fr = leg1 + leg2; hist_p = p1 + p2; hist_d = d1 + d2
+            rv = sample_revisit(sim, pf, hist_fr, hist_p, hist_d, len(leg1), rng, args, ch, floor_y,
+                                source=B, min_geo=args.c_min)
             if rv is None:
                 continue
-            C, yaw_C, covC, aiC, hoC = rv
+            C, yaw_C, covC, aiC, hoC, curveC = rv
             okC, gdC, g3 = geodesic(pf, B, C)
             if not okC or gdC < args.c_min or not _geo_on_floor(g3, floor_y, ftol):
                 continue
@@ -577,7 +602,8 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
                 continue
             p3, d3, r3 = _render_leg(sim, leg3)
             legs.append(leg3); R.append((p3, d3, r3))
-            goals.append(dict(name="C", pos=C, yaw=yaw_C, kind="revisit", covis=covC, covis_argmax=aiC, head_off_deg=hoC))
+            goals.append(dict(name="C", pos=C, yaw=yaw_C, kind="revisit", covis=covC, covis_argmax=aiC,
+                              head_off_deg=hoC, covis_curve=curveC))
 
         # --- assemble (already rendered per leg) ---
         rgbs = [x for (_p, _d, rr) in R for x in rr]
@@ -606,10 +632,14 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
                     goals=[dict(name=g["name"], kind=g["kind"], pos=_d(g["pos"]),
                                 yaw_habitat=g["yaw"], covis=round(float(g["covis"]), 4),
                                 covis_argmax=int(g["covis_argmax"]),
-                                head_off_deg=(round(g["head_off_deg"], 1) if g.get("head_off_deg") is not None else None))
+                                head_off_deg=(round(g["head_off_deg"], 1) if g.get("head_off_deg") is not None else None),
+                                # multi-positive retrieval label: covis vs every history frame [0..step-1];
+                                # loader thresholds into positive/negative/ignore (pos_hi/pos_lo below).
+                                covis_curve=[round(float(c), 4) for c in g["covis_curve"]])
                            for g in goals],
                     geo_startA=float(gdA),
                     covis_band=[args.covis_lo, args.covis_hi], novel_covis=args.novel_covis,
+                    covis_pos_hi=args.covis_pos_hi, covis_pos_lo=args.covis_pos_lo,
                     frame_convention="positions+parquet in data(Zup,M_W); yaw_habitat in render frame")
         return rgbs, depths, poses, meta, goal_rgbs
     return None
@@ -629,6 +659,10 @@ def main():
     # revisit / novel definition (co-visibility) + goal perturbation
     ap.add_argument("--covis_lo", type=float, default=0.20, help="revisit: min max-covisibility with history")
     ap.add_argument("--covis_hi", type=float, default=1.00, help="revisit: max max-covisibility (avoid exact copy)")
+    # multi-positive retrieval label thresholds — RECORDED into meta only; the loader applies them to
+    # covis_curve (positive >= pos_hi, negative <= pos_lo, ignore-band between). Not used at gen time.
+    ap.add_argument("--covis_pos_hi", type=float, default=0.50, help="retrieval positive threshold on covis_curve")
+    ap.add_argument("--covis_pos_lo", type=float, default=0.10, help="retrieval negative threshold on covis_curve")
     ap.add_argument("--head_max_deg", type=float, default=45.0,
                     help="revisit: max |goal yaw - matched frame yaw| (relocalizability envelope)")
     ap.add_argument("--novel_covis", type=float, default=0.10, help="novel B: max covisibility with history must be <")

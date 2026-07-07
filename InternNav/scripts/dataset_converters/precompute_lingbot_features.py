@@ -127,6 +127,10 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
       * ``cam_k`` / ``cam_v`` [S, NI, TD, H, d]  the single camera token's K/V across
             num_iterations × trunk_depth, captured the step each frame is current.
             Injected [0..m] at train/eval time so the camera head relocalizes the goal.
+      * ``cam_pose_enc`` [S, 9]  the head's NATIVE streaming pose (absT, quaR, FoV)
+            per frame — empirically decodes as cam-to-world (despite the VGGT-derived
+            w2c docstring). Used for metric calibration (per-traj monocular scale /
+            map alignment) and as exact anchor poses in the revisit sweep.
 
     The camera head is run via a direct ``camera_head(...)`` call right after each
     ``_aggregate_features`` (it manages its own frame_idx + KV cache); this avoids the
@@ -170,12 +174,13 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
                                        for bl in range(TD)]) for it in range(NI)])
         return ks.permute(3, 0, 1, 2, 4).contiguous(), vs.permute(3, 0, 1, 2, 4).contiguous()
 
-    cam_k_list, cam_v_list = [], []
+    cam_k_list, cam_v_list, cam_pose_list = [], [], []
 
     # Phase 1: scale frames as a single bidirectional block.
     scale_imgs = images[:, :scale].to(dev, non_blocking=True)
     scale_agg, psi = model._aggregate_features(scale_imgs, num_frame_for_scale=scale, num_frame_per_block=scale)
-    ch(scale_agg, causal_inference=True, num_frame_per_block=scale, num_frame_for_scale=scale)
+    pl = ch(scale_agg, causal_inference=True, num_frame_per_block=scale, num_frame_for_scale=scale)
+    cam_pose_list.append(pl[-1][0].float().cpu())            # [scale, 9]
     ck, cv = read_cam_newest(scale); cam_k_list.append(ck); cam_v_list.append(cv)
     if not cam_only:
         cls_list.append(pop_cls(scale))
@@ -187,7 +192,8 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     for i in range(scale, S):
         frame = images[:, i:i + 1].to(dev, non_blocking=True)
         agg_tok, _ = model._aggregate_features(frame, num_frame_for_scale=scale, num_frame_per_block=1)
-        ch(agg_tok, causal_inference=True, num_frame_per_block=1, num_frame_for_scale=scale)
+        pl = ch(agg_tok, causal_inference=True, num_frame_per_block=1, num_frame_for_scale=scale)
+        cam_pose_list.append(pl[-1][0].float().cpu())        # [1, 9]
         ck, cv = read_cam_newest(1); cam_k_list.append(ck); cam_v_list.append(cv)
         if not cam_only:
             cls_list.append(pop_cls(1))
@@ -200,6 +206,7 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     cam_k = torch.cat(cam_k_list, 0).numpy()                     # [S, NI, TD, H, d]
     cam_v = torch.cat(cam_v_list, 0).numpy()
     out = {"cam_k": cam_k, "cam_v": cam_v,
+           "cam_pose_enc": torch.cat(cam_pose_list, 0).numpy(),   # [S, 9]
            "cam_meta": np.array([NI, TD, Hh, d], dtype=np.int64)}
     if cam_only:
         return out
@@ -315,7 +322,8 @@ def main():
                 )
             assert np.isfinite(feats["cam_k"]).all(), "non-finite cam_k"
             # Camera-head cache (always) — small; np.savez (ZIP_STORED) avoids slow deflate.
-            np.savez(cam_path, cam_k=feats["cam_k"], cam_v=feats["cam_v"], cam_meta=feats["cam_meta"])
+            np.savez(cam_path, cam_k=feats["cam_k"], cam_v=feats["cam_v"],
+                     cam_pose_enc=feats["cam_pose_enc"], cam_meta=feats["cam_meta"])
             if not args.cam_only:
                 assert np.isfinite(feats["dino_cls"]).all(), "non-finite dino_cls"
                 save_kwargs = dict(
