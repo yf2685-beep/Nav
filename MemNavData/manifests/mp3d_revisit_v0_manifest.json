@@ -1,0 +1,99 @@
+{
+  "dataset": "mp3d_revisit_v0",
+  "remote_root": "/home/chatsign/data/data-002/Nav/data/generated/mp3d_revisit_v0",
+  "remote_traj_data": "/home/chatsign/data/data-002/Nav/data/generated/mp3d_revisit_v0/vln_n1/traj_data",
+  "local_sources": [
+    "/home/asus/Research/Nav/memnav_viz/mp3d_gen",
+    "/home/asus/Research/Nav/memnav_viz/mp3d_2leg",
+    "/home/asus/Research/Nav/memnav_viz/mp3d_3leg"
+  ],
+  "mp3d_scenes_used": [
+    {
+      "scene_id": "17DRP5sb8fy",
+      "scene_file": "17DRP5sb8fy.glb",
+      "local_glb": "/home/asus/Research/datasets/mp3d/17DRP5sb8fy.glb",
+      "local_navmesh": "/home/asus/Research/datasets/mp3d/17DRP5sb8fy.navmesh"
+    }
+  ],
+  "episodes": [
+    {
+      "target_subdir": "mp3d_gen/episode_0000",
+      "scene": "17DRP5sb8fy.glb",
+      "ep_idx": 0,
+      "n_legs": 2,
+      "n_frames": 430,
+      "switches": [233]
+    },
+    {
+      "target_subdir": "mp3d_gen/episode_0001",
+      "scene": "17DRP5sb8fy.glb",
+      "ep_idx": 1,
+      "n_legs": 2,
+      "n_frames": 278,
+      "switches": [142]
+    },
+    {
+      "target_subdir": "mp3d_gen/episode_0002",
+      "scene": "17DRP5sb8fy.glb",
+      "ep_idx": 2,
+      "n_legs": 2,
+      "n_frames": 262,
+      "switches": [151]
+    },
+    {
+      "target_subdir": "mp3d_2leg/episode_0000",
+      "scene": "17DRP5sb8fy.glb",
+      "ep_idx": 0,
+      "n_legs": 2,
+      "n_frames": 293,
+      "switches": [146]
+    },
+    {
+      "target_subdir": "mp3d_2leg/episode_0001",
+      "scene": "17DRP5sb8fy.glb",
+      "ep_idx": 1,
+      "n_legs": 2,
+      "n_frames": 339,
+      "switches": [171]
+    },
+    {
+      "target_subdir": "mp3d_3leg/episode_0000",
+      "scene": "17DRP5sb8fy.glb",
+      "ep_idx": 0,
+      "n_legs": 3,
+      "n_frames": 506,
+      "switches": [164, 324]
+    },
+    {
+      "target_subdir": "mp3d_3leg/episode_0001",
+      "scene": "17DRP5sb8fy.glb",
+      "ep_idx": 1,
+      "n_legs": 3,
+      "n_frames": 423,
+      "switches": [120, 274]
+    }
+  ],
+  "totals": {
+    "episodes": 7,
+    "frames": 2531,
+    "mp3d_scene_ids": 1
+  },
+  "excluded_local_sources": [
+    {
+      "path": "/home/asus/Research/Nav/memnav_viz/twoleg_pp",
+      "reason": "scene is apartment_1.glb, not MP3D"
+    },
+    {
+      "path": "/home/asus/Research/Nav/memnav_viz/twoleg_proto",
+      "reason": "scene is apartment_1.glb, not MP3D"
+    },
+    {
+      "path": "/home/asus/Research/Nav/memnav_viz/twoleg_smooth",
+      "reason": "scene is apartment_1.glb, not MP3D"
+    },
+    {
+      "path": "/home/asus/Research/Nav/memnav_viz/intern",
+      "reason": "QA images only, not MP3D revisit trajectory data"
+    }
+  ]
+}
