@@ -447,9 +447,18 @@ def sample_revisit(sim, pf, hist_frames, hist_poses, hist_depths, n_anchor, rng,
          curve over EVERY history frame -> argmax = GT relocalization anchor, curve = multi-positive label.
     Returns (pos, goal_yaw, covis, matched_frame, head_off_deg, covis_curve) or None."""
     lo = min(args.anchor_margin, max(0, n_anchor - 1))
+    # long-term (implicit-memory) vs recent (in-view): for a fraction of revisits, force the matched
+    # frame OUTSIDE the current window. current frame = last history frame (len(hist)-1); gap = current-X.
+    hi = n_anchor
+    if rng.uniform() < args.long_term_frac:
+        u2 = len(hist_frames) - args.min_recall_gap          # X <= current - min_recall_gap
+        if u2 > lo:
+            hi = min(n_anchor, u2)
+    if hi <= lo:
+        hi = n_anchor                                         # long-term range empty (short leg) -> free
     R = args.goal_jitter_pos
     for _ in range(args.goal_tries):
-        xi = int(rng.integers(lo, n_anchor)) if n_anchor > lo else int(rng.integers(0, n_anchor))
+        xi = int(rng.integers(lo, hi)) if hi > lo else int(rng.integers(0, n_anchor))
         Xp = hist_frames[xi][0]; Xyaw = float(hist_frames[xi][1])
         r = R * np.sqrt(rng.uniform()); th = rng.uniform(0, 2 * np.pi)      # uniform in the disk
         p = np.array(pf.snap_point([float(Xp[0] + r * np.cos(th)), floor_y, float(Xp[2] + r * np.sin(th))]), float)
@@ -468,7 +477,11 @@ def sample_revisit(sim, pf, hist_frames, hist_poses, hist_depths, n_anchor, rng,
         # position jitter means the sampling anchor X is not necessarily the best match, so the GT
         # matched frame is the curve argmax (relocalization anchor) and the curve is the retrieval label.
         curve = covis_curve(gpts, hist_poses, hist_depths, tol=args.covis_tol)
-        ai = int(curve.argmax()); cov = float(curve[ai])
+        # the relocalization anchor must be goal_append-able (>= anchor_margin: window disjoint from scale);
+        # restrict the argmax to the valid range so we never store a match LingBot can't reconstruct.
+        # frames < anchor_margin are ignore for retrieval (loader masks them; anchor_margin recorded in meta).
+        vlo = min(args.anchor_margin, len(curve) - 1)
+        ai = vlo + int(curve[vlo:].argmax()); cov = float(curve[ai])
         head_off = abs((gyaw - hist_frames[ai][1] + np.pi) % (2 * np.pi) - np.pi)       # vs GT matched frame
         if (args.covis_lo <= cov <= args.covis_hi) and head_off <= np.deg2rad(args.head_max_deg):
             return p, float(gyaw), float(cov), int(ai), float(np.degrees(head_off)), curve
@@ -633,6 +646,9 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
                                 yaw_habitat=g["yaw"], covis=round(float(g["covis"]), 4),
                                 covis_argmax=int(g["covis_argmax"]),
                                 head_off_deg=(round(g["head_off_deg"], 1) if g.get("head_off_deg") is not None else None),
+                                # recall gap = current(=len history-1) - matched frame; large => long-term memory.
+                                recall_gap=(len(g["covis_curve"]) - 1 - int(g["covis_argmax"])
+                                            if int(g["covis_argmax"]) >= 0 else None),
                                 # multi-positive retrieval label: covis vs every history frame [0..step-1];
                                 # loader thresholds into positive/negative/ignore (pos_hi/pos_lo below).
                                 covis_curve=[round(float(c), 4) for c in g["covis_curve"]])
@@ -640,6 +656,9 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
                     geo_startA=float(gdA),
                     covis_band=[args.covis_lo, args.covis_hi], novel_covis=args.novel_covis,
                     covis_pos_hi=args.covis_pos_hi, covis_pos_lo=args.covis_pos_lo,
+                    # LingBot streaming: valid match range = [anchor_margin, step); loader masks [0,anchor_margin)
+                    # from retrieval positives (goal_append can't reconstruct a match below num_scale+window-1).
+                    window=args.window, num_scale=args.num_scale, anchor_margin=args.anchor_margin,
                     frame_convention="positions+parquet in data(Zup,M_W); yaw_habitat in render frame")
         return rgbs, depths, poses, meta, goal_rgbs
     return None
@@ -670,7 +689,19 @@ def main():
     ap.add_argument("--goal_jitter_pos", type=float, default=1.50,
                     help="revisit: uniform-disk RADIUS (m) around the anchor frame X; covis+heading gates cap realized offset")
     ap.add_argument("--goal_jitter_yaw", type=float, default=45.0, help="(unused; heading cone = head_max_deg)")
-    ap.add_argument("--anchor_margin", type=int, default=15, help="revisit anchor X sampled from leg-A frames >= this (num_scale+window-1)")
+    # LingBot goal_append recomputes a FIXED W-frame window [m-W+1..m] around the match and injects it
+    # at RoPE pos total_frames=m-W+1. For that window to have W real frames AND be disjoint from the
+    # scale block [0,num_scale) (else RoPE position collision), need m-W+1 >= num_scale => m >= num_scale+W-1.
+    ap.add_argument("--window", type=int, default=32, help="LingBot local sliding window W (must match precompute)")
+    ap.add_argument("--num_scale", type=int, default=8, help="LingBot scale frames (full dense, injected)")
+    ap.add_argument("--anchor_margin", type=int, default=None,
+                    help="revisit anchor X >= this; default num_scale+window-1 (goal_append window disjoint from scale)")
+    # recent (in-view) vs long-term (implicit-memory) revisit balance. long_term forces the matched frame
+    # to sit OUTSIDE the current window (recall gap >= min_recall_gap), the memory-testing case.
+    ap.add_argument("--long_term_frac", type=float, default=0.7,
+                    help="fraction of revisits forced long-term (X outside current window); rest free (natural in-view mix)")
+    ap.add_argument("--min_recall_gap", type=int, default=None,
+                    help="long-term revisit: min (current - matched) frame gap; default = window")
     ap.add_argument("--goal_tries", type=int, default=40, help="rejection-sampling tries per goal")
     ap.add_argument("--covis_stride", type=int, default=4, help="history frame stride for covisibility")
     ap.add_argument("--covis_tol", type=float, default=0.30, help="depth-consistency tol for covisibility (m)")
@@ -699,6 +730,12 @@ def main():
     ap.add_argument("--eb_rho0", type=float, default=0.6, help="clearance influence radius (m)")
     ap.add_argument("--eb_step", type=float, default=0.04)
     args = ap.parse_args()
+    if args.anchor_margin is None:
+        args.anchor_margin = args.num_scale + args.window - 1     # goal_append window disjoint from scale block
+    if args.min_recall_gap is None:
+        args.min_recall_gap = args.window                        # "outside the current window"
+    print(f"[main] window={args.window} num_scale={args.num_scale} -> anchor_margin={args.anchor_margin}; "
+          f"long_term_frac={args.long_term_frac} min_recall_gap={args.min_recall_gap}")
 
     sim = make_sim(args.scene, args.navmesh, agent_radius=args.agent_radius)
     assert sim.pathfinder.is_loaded, "navmesh not loaded"
@@ -718,7 +755,10 @@ def main():
         rgbs, depths, poses, meta, goal_rgbs = res
         ep_dir = os.path.join(args.out, f"episode_{made:04d}")
         save_traj(ep_dir, rgbs, depths, poses, meta, goal_rgbs)
-        gsum = " ".join(f"{g['name']}[{g['kind']}]covis{g['covis']:.2f}"+(f"/head{g['head_off_deg']:.0f}deg" if g.get('head_off_deg') is not None else "") for g in meta["goals"])
+        gsum = " ".join(f"{g['name']}[{g['kind']}]covis{g['covis']:.2f}"
+                        + (f"/head{g['head_off_deg']:.0f}deg" if g.get('head_off_deg') is not None else "")
+                        + (f"/gap{g['recall_gap']}" if g.get('recall_gap') is not None else "")
+                        for g in meta["goals"])
         print(f"[ep {made}] legs={meta['n_legs']} frames={meta['n_frames']} switches={meta['switches']} "
               f"geo start->A={meta['geo_startA']:.1f} goals: {gsum}")
         made += 1
