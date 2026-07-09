@@ -664,10 +664,58 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
     return None
 
 
+def _count_complete(out_dir, n):
+    """# of consecutive episode_XXXX dirs already fully written (parquet + meta), capped at n."""
+    c = 0
+    while c < n:
+        ep = os.path.join(out_dir, f"episode_{c:04d}")
+        if (os.path.isfile(os.path.join(ep, "data/chunk-000/episode_000000.parquet"))
+                and os.path.isfile(os.path.join(ep, "meta/gen_meta.json"))):
+            c += 1
+        else:
+            break
+    return c
+
+
+def run_legs(sim, args, rng, esdf_cache, n_legs, n, out_dir):
+    """Generate `n` episodes of `n_legs` legs into out_dir, reusing the loaded sim + per-floor ESDF
+    cache. Resumable: if out_dir already holds n complete episodes, skip; otherwise (re)generate from
+    scratch (deterministic given args.seed, so any already-written episodes are reproduced identically)."""
+    if _count_complete(out_dir, n) >= n:
+        print(f"[skip] {out_dir} already complete ({n} episodes)")
+        return n
+    args.n_legs = n_legs
+    os.makedirs(out_dir, exist_ok=True)
+    made = 0
+    for ep in range(n * 6):
+        if made >= n:
+            break
+        res = make_episode(sim, rng, args, made, esdf_cache)
+        if res is None:
+            continue
+        rgbs, depths, poses, meta, goal_rgbs = res
+        ep_dir = os.path.join(out_dir, f"episode_{made:04d}")
+        save_traj(ep_dir, rgbs, depths, poses, meta, goal_rgbs)
+        gsum = " ".join(f"{g['name']}[{g['kind']}]covis{g['covis']:.2f}"
+                        + (f"/head{g['head_off_deg']:.0f}deg" if g.get('head_off_deg') is not None else "")
+                        + (f"/gap{g['recall_gap']}" if g.get('recall_gap') is not None else "")
+                        for g in meta["goals"])
+        print(f"[{n_legs}leg ep {made}] frames={meta['n_frames']} switches={meta['switches']} "
+              f"geo start->A={meta['geo_startA']:.1f} goals: {gsum}")
+        made += 1
+    print(f"DONE: {made}/{n} n_legs={n_legs} -> {out_dir}")
+    return made
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True); ap.add_argument("--navmesh", default="")
     ap.add_argument("--out", required=True); ap.add_argument("--n", type=int, default=5)
+    # dual-leg mode: generate BOTH leg types for one loaded scene, reusing the sim + ESDF cache.
+    # When either is set, --out is a ROOT and output nests as <out>/mp3d_{2,3}leg/<scene_id>/episode_XXXX
+    # (single-scene --n/--n_legs behavior is unchanged when both are None).
+    ap.add_argument("--n2", type=int, default=None, help="dual-leg: #2-leg episodes for this scene")
+    ap.add_argument("--n3", type=int, default=None, help="dual-leg: #3-leg episodes for this scene")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dA_min", type=float, default=3.0); ap.add_argument("--dA_max", type=float, default=9.0)
     ap.add_argument("--b_frac", type=float, nargs=2, default=(0.40, 0.60))
@@ -744,25 +792,21 @@ def main():
           f"each episode is confined to its A's floor (per-floor ESDF cached).")
     esdf_cache = {}                                          # floor bucket -> ESDF (built on demand)
     rng = np.random.default_rng(args.seed)
-    os.makedirs(args.out, exist_ok=True)
-    made = 0
-    for ep in range(args.n * 6):
-        if made >= args.n:
-            break
-        res = make_episode(sim, rng, args, made, esdf_cache)
-        if res is None:
-            continue
-        rgbs, depths, poses, meta, goal_rgbs = res
-        ep_dir = os.path.join(args.out, f"episode_{made:04d}")
-        save_traj(ep_dir, rgbs, depths, poses, meta, goal_rgbs)
-        gsum = " ".join(f"{g['name']}[{g['kind']}]covis{g['covis']:.2f}"
-                        + (f"/head{g['head_off_deg']:.0f}deg" if g.get('head_off_deg') is not None else "")
-                        + (f"/gap{g['recall_gap']}" if g.get('recall_gap') is not None else "")
-                        for g in meta["goals"])
-        print(f"[ep {made}] legs={meta['n_legs']} frames={meta['n_frames']} switches={meta['switches']} "
-              f"geo start->A={meta['geo_startA']:.1f} goals: {gsum}")
-        made += 1
-    print(f"DONE: {made}/{args.n} episodes -> {args.out}")
+    scene_id = os.path.splitext(os.path.basename(args.scene))[0]
+
+    if args.n2 is not None or args.n3 is not None:
+        # dual-leg: one loaded scene -> both leg types, sharing sim + ESDF cache (built once per floor).
+        # nests as <out>/mp3d_{2,3}leg/<scene_id>/episode_XXXX ; the SLURM array does the scene loop.
+        plan = []
+        if args.n2 is not None:
+            plan.append((2, args.n2, os.path.join(args.out, "mp3d_2leg", scene_id)))
+        if args.n3 is not None:
+            plan.append((3, args.n3, os.path.join(args.out, "mp3d_3leg", scene_id)))
+        for n_legs, n, out_dir in plan:
+            run_legs(sim, args, rng, esdf_cache, n_legs, n, out_dir)
+    else:
+        os.makedirs(args.out, exist_ok=True)
+        run_legs(sim, args, rng, esdf_cache, args.n_legs, args.n, args.out)
     sim.close()
 
 
