@@ -94,10 +94,10 @@ def build_esdf(pf, floor_y, res=0.05, pad=0.5, floor_tol=0.8):
     for iz in range(nz):
         for ix in range(nx):
             gx, gz = x0 + ix * res, z0 + iz * res
-            q = pf.snap_point([gx, floor_y, gz])
+            q = pf.snap_point([gx, floor_y, gz]) # nearest navmesh point to the query
             free[iz, ix] = (pf.is_navigable(q) and abs(q[0] - gx) < res and abs(q[2] - gz) < res
                             and abs(q[1] - floor_y) < floor_tol)
-    dist = ndimage.distance_transform_edt(free) * res
+    dist = ndimage.distance_transform_edt(free) * res # distance to the nearest non-free cell (the nearest boundary)
     gzd, gxd = np.gradient(dist, res)
     return dict(dist=dist, gx=gxd, gz=gzd, x0=x0, z0=z0, res=res, nx=nx, nz=nz, floor_y=float(floor_y))
 
@@ -161,95 +161,83 @@ def elastic_smooth(pts, pf, E, iters=60, kc=0.5, kr=0.8, rho0=0.6, step=0.04, re
 
 def pursuit_track(ref_pts, pf, init_pos=None, init_theta=None,
                   v_max=0.0376, L=0.7, r_min=0.40, v_min_frac=0.48,
-                  max_turn_deg=4.5, cam_h=0.5, stop_before=0.0, floor_y=0.0):
+                  max_turn_deg=4.5, cam_h=0.5, stop_before=0.0, floor_y=0.0,
+                  turn_flip_deg=110.0):
     """Pure-pursuit unicycle tracking of a geodesic polyline, matching InternData-N1's
     controller (v≈0.0376 m/frame, lookahead 0.7 m, min radius 0.4 m). Produces smooth,
     COUPLED motion (no in-place spin): cruises with pursuit curvature (radius >= r_min);
     for a target behind (|alpha|>90°, e.g. the A->B U-turn) it rotates at the max angular
     rate while creeping (a tight arc, not a frozen pivot). Snaps to navmesh for collisions."""
-    ref = np.array(densify(ref_pts, 0.05))
-    refg = ref[:, [0, 2]]                                   # ground plane (x,z)
-    kappa_max = 1.0 / r_min
+    ref = np.array(densify(ref_pts, 0.05))  # output waypoints from elastic_smooth
+    refg = ref[:, [0, 2]]                   # ground plane (x,z)
+    kappa_max = 1.0 / r_min                 # curvature: standard geometric measure of how sharply a path bends. defined as the reciprocal of the turning radius: 1 / R
     mturn = np.deg2rad(max_turn_deg)
-    pos = (np.asarray(init_pos)[[0, 2]] if init_pos is not None else refg[0]).astype(float)
+    pos = (np.asarray(init_pos)[[0, 2]] if init_pos is not None else refg[0]).astype(float) # robot's position
+    # psi is the HABITAT camera yaw everywhere (camera forward = travel dir = (-sin psi, -cos psi)).
+    # ONE convention: the stored frame yaw is psi as-is (no conversion), and it winds with the right
+    # sign, so any downstream heading/omega derived from the pose is consistent by construction.
+    # psi: counterclockwise rotation about the +Y (up) axis 
     if init_theta is not None:
-        theta = float(init_theta)
+        psi = float(init_theta)                              # already a habitat yaw (prev leg's last frame)
     else:
-        d = refg[min(5, len(refg) - 1)] - pos; theta = np.arctan2(d[1], d[0])
-    ci, frames, goal = 0, [], refg[-1]
-    arclen = float(np.sum(np.linalg.norm(np.diff(refg, axis=0), axis=1)))
+        psi = yaw_facing(refg[min(5, len(refg) - 1)] - pos)  # face the initial path direction
+    ci, frames, goal = 0, [], refg[-1]  # initialization. ci: path index. frames: output/the trajectory recorded so far. goal: the (x, z) endpoint of the reference path
+    arclen = float(np.sum(np.linalg.norm(np.diff(refg, axis=0), axis=1))) #  total length of the reference path
     max_steps = int(arclen / v_max * 4) + 300     # generous vs ideal frame count
     stall = 0
+
     for _ in range(max_steps):
         prev = pos.copy()
-        ci += int(np.argmin(np.linalg.norm(refg[ci:ci + 40] - pos, axis=1)))
-        li, acc = ci, 0.0
+        ci += int(np.argmin(np.linalg.norm(refg[ci:ci + 40] - pos, axis=1))) #  index of the point on reference path the robot is currently closest to
+        li, acc = ci, 0.0  # li: look ahead index
         while li + 1 < len(refg) and acc < L:
-            acc += np.linalg.norm(refg[li + 1] - refg[li]); li += 1
-        to = refg[li] - pos
-        alpha = (np.arctan2(to[1], to[0]) - theta + np.pi) % (2 * np.pi) - np.pi
+            acc += np.linalg.norm(refg[li + 1] - refg[li])
+            li += 1
+        to = refg[li] - pos  # look ahead point
+        alpha = (yaw_facing(to) - psi + np.pi) % (2 * np.pi) - np.pi   # heading error (habitat yaw)
+        # clearance-aware turn direction: for a near-reversal, the shorter-angle turn (sign of alpha) may
+        # sweep the r_min arc INTO a wall while the OTHER side is open. Probe both arc centres; if the
+        # short side is tighter, turn the "long way" (flip alpha by 2*pi) through the clear side.
+        if abs(alpha) > np.deg2rad(turn_flip_deg):
+            tl = np.array([-np.cos(psi), np.sin(psi)])   # side the arc bulges toward when psi INCREASES
+            cL = pf.distance_to_closest_obstacle([pos[0] + r_min * tl[0], floor_y, pos[1] + r_min * tl[1]])
+            cR = pf.distance_to_closest_obstacle([pos[0] - r_min * tl[0], floor_y, pos[1] - r_min * tl[1]])
+            if alpha > 0 and cL + 0.1 < cR:
+                alpha -= 2 * np.pi                        # short turn bulges into the wall -> go the long way
+            elif alpha < 0 and cR + 0.1 < cL:
+                alpha += 2 * np.pi
         # Smooth, single-branch control law (no bang-bang) so v/omega/radius vary
         # continuously through a turn -> no delta-spikes, matches N1's motion:
         #  * speed eases off in turns (N1: corr(turn,speed)=-0.49, floor ~0.48*cruise)
         #  * curvature is proportional to heading error, capped at kappa_max=1/r_min,
         #    so the tightest turn (incl. the U-turn) holds radius r_min, not a spin.
-        v = v_max * (v_min_frac + (1 - v_min_frac) * (1 + np.cos(alpha)) / 2)
-        kappa = np.clip(2.0 * alpha / L, -kappa_max, kappa_max)
-        dtheta = np.clip(kappa * v, -mturn, mturn)
-        theta += dtheta
-        ng = pos + v * np.array([np.cos(theta), np.sin(theta)])
-        snap = pf.snap_point([ng[0], floor_y, ng[1]])
+        v = v_max * (v_min_frac + (1 - v_min_frac) * (1 + np.cos(alpha)) / 2) # Speed: slow down in turns
+        kappa = np.clip(2.0 * alpha / L, -kappa_max, kappa_max)               # Curvature: steer proportionally, capped at the tightest arc
+        dpsi = np.clip(kappa * v, -mturn, mturn)                              # Yaw increment: turning is proportional to distance travelled
+        psi += dpsi
+        fwd = np.array([-np.sin(psi), -np.cos(psi)])  # habitat camera forward = travel direction
+        ng = pos + v * fwd                            # next ground position
+        snap = pf.snap_point([ng[0], floor_y, ng[1]]) # project onto walkable space
         if (not pf.is_navigable(snap)) or np.hypot(snap[0] - ng[0], snap[2] - ng[1]) > 0.25:
-            ng = pos + 0.3 * v * np.array([np.cos(theta), np.sin(theta)])   # creep if blocked
-            snap = pf.snap_point([ng[0], floor_y, ng[1]])
-        pos = np.array([snap[0], snap[2]])
-        frames.append((np.array([snap[0], snap[1] + cam_h, snap[2]]), theta))
+            ng = pos + 0.3 * v * fwd                         # creep if blocked
+            snap = pf.snap_point([ng[0], floor_y, ng[1]])    # Retry the step at 30% length (~1.2 cm instead of ~4 cm)
+        pos = np.array([snap[0], snap[2]])                   # robot's 2D pos is updated from the snapped point
+        frames.append((np.array([snap[0], snap[1] + cam_h, snap[2]]), psi))   # psi = commanded (fallback)
+        # forward-difference re-derive: now this step is known, set the PREVIOUS frame's yaw to face its
+        # REALIZED displacement (where the robot actually went), not the commanded psi — the navmesh snap
+        # can slide the robot off psi by up to ~80deg on wall-grazing frames, and the policy/PSR read the
+        # realized motion. Gate sub-1cm steps (creep/stall) -> keep commanded psi (dodge atan2 noise).
+        d = pos - prev                                         # the step just realized
+        if len(frames) >= 2 and np.linalg.norm(d) > 0.01:
+            frames[-2] = (frames[-2][0], float(yaw_facing(d))) # patch the PREVIOUS frame
         if stop_before > 0 and np.linalg.norm(pos - goal) < stop_before:
-            return frames, True           # hand off to arrive_facing for the terminal pose
-        if ci >= len(refg) - 2 and np.linalg.norm(pos - goal) < 0.15:
+            return frames, True           # early stop (unused: goal is a recognition target, not an arrival pose)
+        if ci >= len(refg) - 2 and np.linalg.norm(pos - goal) < 0.15:  # Real success
             return frames, True
         stall = stall + 1 if np.linalg.norm(pos - prev) < 0.004 else 0
         if stall > 40:                       # wedged against geometry -> give up
             return frames, False
     return frames, np.linalg.norm(pos - goal) < 0.3
-
-
-def arrive_facing(init_pos, init_theta, goal_xz, goal_yaw, pf,
-                  v_max=0.0376, r_min=0.40, v_min_frac=0.48, max_turn_deg=4.5, cam_h=0.5,
-                  ka=1.0, kb=0.35, pos_tol=0.15, max_steps=320, floor_y=0.0):
-    """Option D: Astolfi pose-to-pose feedback (PythonRobotics move_to_pose) — curve from
-    (init_pos, init_theta) to arrive AT goal_xz FACING goal_yaw with NO in-place pivot.
-    Forward-only, per-frame caps (v_max, max_turn, slows in sharp turns so it can tighten the
-    alignment curve), navmesh-snapped. Returns (frames, ok)."""
-    mturn = np.deg2rad(max_turn_deg)
-    pos = np.asarray(init_pos, float)[[0, 2]] if len(np.asarray(init_pos)) == 3 else np.asarray(init_pos, float)
-    theta = float(init_theta); frames = []; stall = 0
-    for _ in range(max_steps):
-        d = np.asarray(goal_xz, float) - pos
-        rho = float(np.hypot(d[0], d[1]))
-        alpha = (np.arctan2(d[1], d[0]) - theta + np.pi) % (2 * np.pi) - np.pi
-        beta = (goal_yaw - theta - alpha + np.pi) % (2 * np.pi) - np.pi
-        herr = (goal_yaw - theta + np.pi) % (2 * np.pi) - np.pi
-        if rho < pos_tol and abs(herr) <= mturn:
-            snap = pf.snap_point([pos[0], 0.0, pos[1]])
-            frames.append((np.array([snap[0], snap[1] + cam_h, snap[2]]), float(goal_yaw)))
-            return frames, True
-        # speed ramps down near the goal but keeps a small floor so it can FINISH a large
-        # alignment turn (a hard v->0 stalls before aligning; too big a floor orbits).
-        v = v_max * float(np.clip(rho / 0.5, 0.12, 1.0))
-        dtheta = np.clip(ka * alpha - kb * beta, -mturn, mturn)
-        theta += dtheta
-        ng = pos + v * np.array([np.cos(theta), np.sin(theta)])
-        snap = pf.snap_point([ng[0], floor_y, ng[1]])
-        if (not pf.is_navigable(snap)) or np.hypot(snap[0] - ng[0], snap[2] - ng[1]) > 0.25:
-            ng = pos + 0.3 * v * np.array([np.cos(theta), np.sin(theta)])
-            snap = pf.snap_point([ng[0], floor_y, ng[1]])
-        prev = pos.copy(); pos = np.array([snap[0], snap[2]])
-        frames.append((np.array([snap[0], snap[1] + cam_h, snap[2]]), theta))
-        stall = stall + 1 if np.linalg.norm(pos - prev) < 0.003 else 0
-        if stall > 40:
-            return frames, False
-    return frames, False          # ran out of budget without a clean pose arrival -> caller falls back
 
 
 def agent_state(pos, yaw):
@@ -553,20 +541,18 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
         floor_y = float(A[1])
         E = _get_esdf(esdf_cache, pf, floor_y, args)
         cp = dict(v_max=args.v, L=args.lookahead, r_min=args.r_min, v_min_frac=args.v_min_frac,
-                  max_turn_deg=args.max_turn_deg, cam_h=args.cam_h, floor_y=floor_y)
+                  max_turn_deg=args.max_turn_deg, cam_h=args.cam_h, floor_y=floor_y)  # pure-pursuit controller parameters,
         # --- start on A's floor, geodesic start->A stays on floor ---
         start = None
         for _ in range(30):
             s = _rand_on_floor(pf, floor_y, ftol)
             if s is None:
                 continue
-            ok, gd, pts = geodesic(pf, s, A)
+            ok, gd, pts = geodesic(pf, s, A) # from start to A. gd:  the geodesic distance, pts: 3D waypoints of the path
             if ok and args.dA_min <= gd <= args.dA_max and _geo_on_floor(pts, floor_y, ftol):
-                start = s; break
+                start, gdA, g1 = s, gd, pts
+                break
         if start is None:
-            continue
-        okA, gdA, g1 = geodesic(pf, start, A)
-        if not okA or not _geo_on_floor(g1, floor_y, ftol):
             continue
         leg1, ok = roll_leg(g1, pf, E, eb, cp, None, None)          # A = fresh forward goal
         if not ok:
@@ -625,14 +611,24 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
         allframes = [f for lg in legs for f in lg]
         switches = [int(s) for s in np.cumsum([len(lg) for lg in legs])[:-1]]
 
-        # --- segment collision backstop ---
+        # --- trajectory safety gate: reject (retry) the WHOLE episode if any sharp turn-rate spike or
+        #     any segment clips geometry. Cheap net guaranteeing the written trajectory is smooth +
+        #     collision-free even where the controller's per-frame caps didn't (e.g. snap-slide jumps). ---
         fy = float(allframes[0][0][1] - args.cam_h)
+        xyt = np.array([[f[0][0], f[0][2]] for f in allframes])
+        # (1) turn rate: no frame-to-frame heading change sharper than max_frame_turn (radius >= r_min ->
+        #     ~v/turn; a spike means the realized motion kinked, e.g. a navmesh snap-slide).
+        seg = np.diff(xyt, axis=0)
+        tang = np.unwrap(np.arctan2(seg[:, 1], seg[:, 0]))
+        if len(tang) > 1 and float(np.abs(np.degrees(np.diff(tang))).max()) > args.max_frame_turn:
+            continue
+        # (2) collision: sample densely along every inter-frame segment; all must stay on the navmesh
+        #     (a straight hop between two navigable frames can still clip an obstacle corner).
         def _gnav(x, z):
             q = pf.snap_point([x, fy, z])
             return pf.is_navigable(q) and abs(q[0] - x) < 0.06 and abs(q[2] - z) < 0.06
-        if any(not _gnav((allframes[i - 1][0][0] + allframes[i][0][0]) / 2,
-                         (allframes[i - 1][0][2] + allframes[i][0][2]) / 2)
-               for i in range(1, len(allframes))):
+        if any(not _gnav(xyt[i - 1, 0] * (1 - t) + xyt[i, 0] * t, xyt[i - 1, 1] * (1 - t) + xyt[i, 1] * t)
+               for i in range(1, len(xyt)) for t in (0.25, 0.5, 0.75)):
             continue
 
         goal_rgbs = [render(sim, np.asarray(g["pos"], float) + ch, g["yaw"])[0] for g in goals]
@@ -769,6 +765,8 @@ def main():
     ap.add_argument("--v_min_frac", type=float, default=0.48,
                     help="speed floor as frac of cruise during sharp turns (N1-measured ~0.48)")
     ap.add_argument("--max_attempts", type=int, default=60); ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--max_frame_turn", type=float, default=15.0,
+                    help="safety gate: reject+retry the episode if any frame's heading changes more than this (deg)")
     # navmesh inflation + ElasticBands clearance smoothing (from PythonRobotics / iPlanner)
     ap.add_argument("--agent_radius", type=float, default=0.30, help="navmesh inflation = robot radius (m)")
     ap.add_argument("--esdf_res", type=float, default=0.05, help="scene ESDF grid resolution (m)")

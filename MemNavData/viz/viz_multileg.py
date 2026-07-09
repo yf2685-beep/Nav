@@ -12,7 +12,8 @@ m = json.load(open(os.path.join(args.episode, "meta/gen_meta.json")))
 sw = m["switches"]; n = m["n_frames"]
 A = np.stack([np.array(a.tolist(), float).reshape(4, 4) for a in
               pd.read_parquet(os.path.join(args.episode, "data/chunk-000/episode_000000.parquet"))["action"]])
-xy = A[:, :2, 3]; yaw = np.unwrap(np.arctan2(A[:, 1, 0], A[:, 0, 0])); haby = float(np.median(A[:, 2, 3]))
+xy = A[:, :2, 3]; yaw = np.unwrap(np.arctan2(-A[:, 1, 2], -A[:, 0, 2])); haby = float(np.median(A[:, 2, 3]))
+# heading = camera forward (-Z col) projected to the data ground plane, NOT the x-axis (1st col)
 
 bk = habitat_sim.SimulatorConfiguration(); bk.scene_id = args.scene; bk.enable_physics = False
 sim = habitat_sim.Simulator(habitat_sim.Configuration(bk, [habitat_sim.agent.AgentConfiguration()]))
@@ -20,10 +21,15 @@ pf = sim.pathfinder
 ns = habitat_sim.NavMeshSettings(); ns.set_defaults(); ns.agent_radius = args.agent_radius; sim.recompute_navmesh(pf, ns)
 x0, x1 = xy[:, 0].min()-1, xy[:, 0].max()+1; y0, y1 = xy[:, 1].min()-1, xy[:, 1].max()+1; res = 0.06
 xs = np.arange(x0, x1, res); ys = np.arange(y0, y1, res); occ = np.zeros((len(ys), len(xs)))
+# haby is the CAMERA height; snap_point returns the FLOOR (~cam_h below), and the floor itself varies
+# along the path -> compare the snapped floor to the reference floor (haby - cam_h), not to haby, or a
+# lower/sloping floor is wrongly marked non-navigable (black). cam_h=0.5 matches generation; band 0.8m.
+CAM_H = 0.5
 for iy, gy in enumerate(ys):
     for ix, gx in enumerate(xs):
         q = pf.snap_point([gx, haby, -gy])
-        occ[iy, ix] = 1 if (pf.is_navigable(q) and abs(q[0]-gx) < res and abs(q[2]+gy) < res and abs(q[1]-haby) < 0.8) else 0
+        occ[iy, ix] = 1 if (pf.is_navigable(q) and abs(q[0]-gx) < res and abs(q[2]+gy) < res
+                            and abs(q[1] - (haby - CAM_H)) < 0.8) else 0
 sim.close()
 
 fig, ax = plt.subplots(figsize=(15, 10))
@@ -37,7 +43,8 @@ ax.scatter(xy[sw[0]-1, 0], xy[sw[0]-1, 1], c="cyan", s=110, ec="k", zorder=6, la
 for g, c in zip(m["goals"], ["magenta", "gold"]):
     p = g["pos"]; ax.scatter(p[0], p[1], s=210, marker="*", ec="k", c=c, zorder=7,
                              label=f"{g['name']} [{g['kind']}] covis={g['covis']:.2f}")
-    ax.arrow(p[0], p[1], .35*np.cos(g["yaw_habitat"]), .35*np.sin(g["yaw_habitat"]), head_width=.11, color="k", lw=2, zorder=8)
+    gy = g["yaw_habitat"]  # habitat yaw -> data-frame forward = (-sin, cos)
+    ax.arrow(p[0], p[1], .35*-np.sin(gy), .35*np.cos(gy), head_width=.11, color="k", lw=2, zorder=8)
     ai = g.get("covis_argmax", -1)
     if ai is not None and ai >= 0:
         ax.scatter(xy[ai, 0], xy[ai, 1], s=90, marker="D", ec="k", c=c, zorder=7)   # matched history frame
