@@ -120,6 +120,14 @@ always-null). `cand_mask` (= `E(k)`) is emitted alongside `pos_mask`/`neg_mask`:
 - **gate** — BCE on `sigmoid(a·max_i cos_i + b)` vs `is_revisit`, over the max cosine
   across `E(k)` (probe: absolute top-1 cosine separates revisit/novel at AUC≈0.91).
 
+`pos_mask` also drives **teacher forcing of the goal_append anchor** in the policy
+(`encode_memory`). The aux-pose / revisit tokens need `goal_pose` regressed by anchoring
+the goal image next to a *co-visible* history frame; anchoring at retrieval's live
+`match_idx` makes them unlearnable until retrieval converges (chicken-and-egg). So at
+**train** time the anchor is the best-scoring **positive** (`ret_logits.masked_fill(~pos,
+-inf).argmax`), and at **eval** it falls back to `match_idx` (what a converged retrieval
+picks). Novel rows keep `match_idx` (aux weight is 0 there).
+
 ---
 
 ## 5. The action label (`_build_actions`)

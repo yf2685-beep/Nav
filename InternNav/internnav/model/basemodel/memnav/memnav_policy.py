@@ -270,7 +270,7 @@ class MemNavNet(nn.Module):
         return dict(
             noise_ng=noise_ng, noise_mg=noise_mg, noise=noise,
             aux_pose=aux_pose, ret_logits=enc["ret_logits"], revisit_gate=gate,
-            gate_logit=enc["gate_logit"],
+            gate_logit=enc["gate_logit"], match_idx=enc["match_idx"], anchor_idx=enc["anchor_idx"],
         )
 
     @torch.no_grad()
@@ -314,6 +314,20 @@ class MemNavNet(nn.Module):
         match_idx, gate_logit, ret_logits = self.retrieval(goal_cls, mem_cls, cand_mask)
         revisit_gate = torch.sigmoid(gate_logit)       # P(revisit) for the decoder soft-gate
 
+        # goal_append anchor: at TRAIN time teacher-force it to a GT co-visible frame so the
+        # goal_pose (-> aux + revisit token) is well-anchored from step 1, decoupling those
+        # heads from retrieval convergence. At EVAL (no pos_mask / self.eval()) fall back to
+        # the live match_idx — the same anchor a converged retrieval produces. Novel rows have
+        # no positive -> keep match_idx (aux weight is 0 for them anyway).
+        pos_mask = batch.get("batch_pos_mask")
+        if self.training and pos_mask is not None:
+            pos_mask = pos_mask.to(dev).bool()
+            NEG_INF = torch.finfo(ret_logits.dtype).min
+            tf_idx = ret_logits.masked_fill(~pos_mask, NEG_INF).argmax(-1)   # best-scoring positive
+            anchor = torch.where(pos_mask.any(-1), tf_idx, match_idx)
+        else:
+            anchor = match_idx
+
         B = len(batch["cache_paths"])
         W, lo = self.window, self.num_scale + self.window - 1
         cur_t, dfeat_t, curp, goalp = [], [], [], []
@@ -331,8 +345,8 @@ class MemNavNet(nn.Module):
                 cur = wt[-1]                                                        # [P, 2C]
                 dfeat = self.lingbot.depth_feature(cur_agg, win_img[-1:][None], psi)  # [Pf, Cd]
                 cur_pose = self.lingbot.camera_pose(ck, cv, k, cur_agg)[-1]         # [9] current abs pose
-                # (2) revisit: goal_append at the matched frame (clamped valid) -> goal abs pose
-                m = int(match_idx[b].clamp(lo, k - 1).item())
+                # (2) revisit: goal_append at the anchor frame (clamped valid) -> goal abs pose
+                m = int(anchor[b].clamp(lo, k - 1).item())
                 mw = self.lingbot.load_images([os.path.join(rgb_dir, f"{i}.jpg")
                                                for i in range(m - W + 1, m + 1)]).to(dev)
                 _, goal_agg = self.lingbot.goal_append(goal_img, cache, m, mw, return_agg=True)
@@ -345,8 +359,8 @@ class MemNavNet(nn.Module):
             depth_feat=torch.stack(dfeat_t), # [B, Pf, Cd]   depth-head geometry
             cur_pose=torch.stack(curp),      # [B, 9]        current absolute camera pose (map frame)
             goal_pose=torch.stack(goalp),    # [B, 9]        goal absolute camera pose (map frame)
-            match_idx=match_idx, revisit_gate=revisit_gate, gate_logit=gate_logit,
-            ret_logits=ret_logits,
+            match_idx=match_idx, anchor_idx=anchor, revisit_gate=revisit_gate,
+            gate_logit=gate_logit, ret_logits=ret_logits,
         )
 
 

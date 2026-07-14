@@ -82,7 +82,8 @@ memnav_exp_cfg = ExpCfg(
         token_dim=384,
         num_diffusion_iters=10,
         # loss weights (consumed by MemNavTrainer)
-        w_retrieval=1.0,
+        w_retrieval=1.0,   # ranking InfoNCE (which candidate frame matches)
+        w_gate=1.0,        # revisit/novel gate BCE (is there a match at all)
         w_aux_pose=0.5,
         ddp_find_unused_parameters=True,
     ),
