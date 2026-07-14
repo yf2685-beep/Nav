@@ -335,7 +335,11 @@ def covis_curve(goal_pts_world, poses, depths, tol=0.3):
 
 
 def save_traj(out_dir, rgbs, depths, poses_hab, meta, goal_rgbs):
-    import pandas as pd
+    import pandas as pd, shutil
+    # Wipe any prior (re)generation of this episode first: writing in place with
+    # os.makedirs(exist_ok=True) would leave orphan tail frames when the new
+    # trajectory is shorter than a previous one (stale N..M jpgs/pngs never overwritten).
+    shutil.rmtree(out_dir, ignore_errors=True)
     rgb_d = os.path.join(out_dir, "videos/chunk-000/observation.images.rgb")
     dep_d = os.path.join(out_dir, "videos/chunk-000/observation.images.depth")
     dat_d = os.path.join(out_dir, "data/chunk-000"); met_d = os.path.join(out_dir, "meta")

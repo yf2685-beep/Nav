@@ -103,6 +103,31 @@ class LingBotStream(nn.Module):
         for p in self.model.parameters():
             p.requires_grad_(False)
 
+        # 3D-RoPE table extension (mirrors precompute build_model): the aggregator
+        # sizes its WanRotaryPosEmbed table to max_frame_num, but the CAMERA HEAD
+        # hardcodes max_seq_len=1024. camera_pose() runs the camera head forward at
+        # the current frame index k (up to ~1917 for long 3leg episodes), so its
+        # table must be extended too or forward() slices past the end and crashes
+        # ("size of tensor a (32) must match b (22)"). Rebuild every rope table whose
+        # max_seq_len < max_frame_num up to max_frame_num; the overlap region is
+        # bit-identical (theta=10000, analytic), so <=1024 behavior is unchanged.
+        from lingbot_map.layers.rope import WanRotaryPosEmbed, get_1d_rotary_pos_embed
+        n_ext = 0
+        for mod in self.model.modules():
+            if isinstance(mod, WanRotaryPosEmbed) and mod.max_seq_len < max_frame_num:
+                t_dim, h_dim, w_dim = mod.fhw_dim
+                old = mod.freqs
+                new = torch.cat([get_1d_rotary_pos_embed(
+                                    d, max_frame_num, 10000.0, use_real=False,
+                                    repeat_interleave_real=False, freqs_dtype=torch.float64)
+                                 for d in (t_dim, h_dim, w_dim)], dim=1)
+                assert torch.allclose(new[:old.shape[0]].to(old.dtype), old.to(new.dtype).to(old.dtype),
+                                      atol=1e-6), "RoPE table rebuild changed the overlap region"
+                mod.freqs = new.to(old.device)
+                mod.max_seq_len = max_frame_num
+                n_ext += 1
+        print(f"[LingBotStream] extended {n_ext} RoPE table(s) to max_frame_num={max_frame_num}")
+
         self.agg = self.model.aggregator
         self.depth = self.agg.depth
 

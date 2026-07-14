@@ -96,6 +96,7 @@ class MemNav_Dataset(NavDP_Base_Datset):
         anchor_margin=None,
         glimpse_pos=14,
         glimpse_neg=83,
+        exclude_recent=83,
         goal_slack=4,
         add_goalA=True,
         pred_digit=4,
@@ -131,6 +132,14 @@ class MemNav_Dataset(NavDP_Base_Datset):
         # `glimpse_neg` (p95 rise ~83) definitely don't; the band between is ignore.
         self.glimpse_pos = int(glimpse_pos)
         self.glimpse_neg = int(glimpse_neg)
+        # UNIFIED revisit rule (A/B/C): a history frame is a revisit CANDIDATE only if it
+        # is >= exclude_recent frames behind the current step k. Anything nearer is the
+        # current approach (the robot sees the goal because it is walking toward it) and
+        # is routed to the novel / in-FoV branch, NOT revisit. exclude_recent = the covis
+        # onset horizon (p90 of the covis>=0.1 onset distance): every approach frame is
+        # within `onset` of the goal and k <= goal, so within `onset` of k -> excluded;
+        # genuine loop closures sit ~hundreds of frames back (median 321) -> retained.
+        self.exclude_recent = int(exclude_recent)
         self.goal_slack = int(goal_slack)   # min forward frames current(k) -> goal_step
         self.add_goalA = bool(add_goalA)
         self.meta_filename = meta_filename
@@ -183,7 +192,7 @@ class MemNav_Dataset(NavDP_Base_Datset):
                     entire_task_dir = os.path.join(scene_path, traj_dir)
                     if not os.path.isdir(entire_task_dir):
                         continue
-                    data_path = os.path.join(entire_task_dir, 'data/chunk-000/episode_000000.parquet')
+                    data_path = os.path.join(entire_task_dir, 'data/chunk-000/episode_000000.parquet') # poses/extrinsics
                     afford_path = os.path.join(entire_task_dir, 'data/chunk-000/path.ply')
                     if self.feature_root:
                         rel = os.path.relpath(os.path.join(entire_task_dir, 'videos/chunk-000'), root_dirs)
@@ -212,13 +221,13 @@ class MemNav_Dataset(NavDP_Base_Datset):
         self.repeat = max(1, int(repeat))
         n_traj = len(self.trajectory_dirs)
         n_samp = len(self.samples)
-        # covis goals have a static revisit/novel flag; goal-A is dynamic (k-dependent).
+        # revisit/novel is now DYNAMIC per sampled k (unified rule), so we can only count
+        # goal TYPES here, not a static revisit/novel split.
         n_covis = sum(1 for s in self.samples if s['has_covis'])
-        n_rev = sum(1 for s in self.samples if s['has_covis'] and not s['null_pos'])
         n_goalA = n_samp - n_covis
         print(f"[MemNav_Dataset] {n_samp} goal-samples across {n_traj} episodes under "
-              f"{root_dirs} (covis: revisit={n_rev}, novel={n_covis - n_rev}; "
-              f"goalA[dynamic]={n_goalA}, repeat={self.repeat})")
+              f"{root_dirs} (covis B/C={n_covis}, goalA={n_goalA}; "
+              f"revisit/novel dynamic per-k, exclude_recent={self.exclude_recent}, repeat={self.repeat})")
         if n_samp == 0:
             raise RuntimeError(
                 f"No goal-samples found under {root_dirs}. Need '{self.feature_filename}' "
@@ -252,12 +261,18 @@ class MemNav_Dataset(NavDP_Base_Datset):
         pos_lo = float(meta.get('covis_pos_lo', self.covis_pos_lo))
         amargin = int(meta.get('anchor_margin', self.anchor_margin_default))
         slack = self.goal_slack
+        t = self.exclude_recent
         out = []
 
         def _rgb(i):
             return os.path.join(rgb_dir, f'{int(i)}.jpg')
 
-        # --- covis goals B, C, ... : pick k inside leg j, label by covis (pre-approach) ---
+        # k is sampled per __getitem__ in the goal's own leg. The candidate region
+        # E(k) = [amargin .. k-t] must be non-empty -> k >= amargin + t. Labels
+        # (pos/neg/cand/null_pos) are built DYNAMICALLY from the raw covis curve in
+        # _build_label; here we only store the curve + thresholds + the k-range.
+
+        # --- covis goals B, C, ... : pick k inside leg j, label by covis over E(k) ---
         for j, g in enumerate(goals):
             curve = g.get('covis_curve')
             if not curve:
@@ -267,30 +282,26 @@ class MemNav_Dataset(NavDP_Base_Datset):
             # goal_step = last frame of this goal's leg (leg j+1)
             leg_end = int(switches[j + 1]) if (j + 1) < len(switches) else n_frames
             goal_step = leg_end - 1
-            k_lo = max(leg_start, amargin)              # window-forward + full covis observed
+            k_lo = max(leg_start, amargin + t)          # own leg AND E(k) non-empty
             k_hi = goal_step - slack                    # >= slack frames of forward motion
             if k_hi < k_lo:                             # leg too short to sample
                 continue
             goal_img_path = os.path.join(traj_dir, f'goal_{j + 1}.jpg')
             if not (os.path.isfile(goal_img_path) and os.path.isfile(_rgb(k_lo))):
                 continue
-            idx = np.arange(leg_start)
-            valid = idx >= amargin
-            pos_pre = valid & (curve >= pos_hi)         # [leg_start] bool
-            neg_pre = valid & (curve <= pos_lo)
-            null_pos = not bool(pos_pre.any())          # static: revisit iff a covis peak survives
             out.append(dict(has_covis=True, goal_j=j, leg_start=leg_start, goal_step=goal_step,
                             k_lo=int(k_lo), k_hi=int(k_hi), goal_img_path=goal_img_path,
-                            pos_pre=pos_pre, neg_pre=neg_pre, null_pos=null_pos, amargin=amargin))
+                            curve=curve, pos_hi=pos_hi, pos_lo=pos_lo, amargin=amargin))
 
-        # --- goal A (first milestone, no covis / no rendered goal image) ---
+        # --- goal A (first milestone): no earlier pass, so ALWAYS novel under the unified
+        #     rule (its only co-observers are recent approach frames -> excluded by E(k)).
+        #     Kept as clean NOVEL training signal (gate label 0 + novel action branch). ---
         if self.add_goalA and len(switches) >= 1:
             a_frame = int(switches[0]) - 1              # last frame of leg 1 (arrived at A)
             goal_step = a_frame
-            k_lo = amargin
+            k_lo = amargin + t                          # E(k) non-empty (all-negative for A)
             k_hi = goal_step - slack
-            # need >=1 clean negative for the novel regime: T_A - glimpse_neg >= amargin
-            if k_hi >= k_lo and (a_frame - self.glimpse_neg) >= amargin and os.path.isfile(_rgb(a_frame)):
+            if k_hi >= k_lo and os.path.isfile(_rgb(a_frame)):
                 out.append(dict(has_covis=False, goal_j=-1, leg_start=0, goal_step=goal_step,
                                 k_lo=int(k_lo), k_hi=int(k_hi), goal_img_path=_rgb(a_frame),
                                 T_A=a_frame, amargin=amargin))
@@ -341,36 +352,42 @@ class MemNav_Dataset(NavDP_Base_Datset):
 
     # ------------------------------------------------------------------ #
     def _build_label(self, s, k):
-        """Safe-gated multi-positive retrieval label over history ``[0..k]``.
+        """Unified revisit label over the candidate region ``E(k) = [amargin .. k-t]``
+        (``t = exclude_recent``).  Frames nearer than ``t`` to ``k`` are the current
+        approach (goal seen because we are walking toward it) -> excluded from revisit,
+        routed to the novel branch.  Same rule for A/B/C, and identical at inference
+        (needs only ``k``, no leg structure).
 
-          (1) covis goal (B/C): use the pre-approach covis pos/neg (length
-              ``leg_start``); own-leg ``[leg_start..k]`` -> ignore.  ``null_pos``
-              is the static covis flag.
-          (2) goal A (no covis): frame-offset from arrival ``T_A`` -- ``pos: i >=
-              T_A-glimpse_pos``, ``neg: i <= T_A-glimpse_neg & i >= amargin``, else
-              ignore; ``null_pos`` is dynamic (novel until the glimpse is observed).
-        Returns (pos_mask, neg_mask, null_pos) with masks length ``k+1`` (bool).
+          * covis goal (B/C): ``pos = covis >= pos_hi`` within E(k); ``neg = covis <=
+            pos_lo`` within E(k).  Own-leg / undefined-covis frames are 0 (they sit
+            >t back, i.e. beyond the covis onset -> genuinely don't see the goal).
+          * goal A: no earlier pass -> ``pos = {}``, ``neg = E(k)`` (all candidates).
+
+        ``null_pos`` (= novel) is DYNAMIC: True iff E(k) contains no positive.
+        Returns (pos_mask, neg_mask, cand_mask, null_pos), each length ``k+1`` bool.
         """
+        am = int(s['amargin'])
+        hi = k - self.exclude_recent                       # candidate upper bound (inclusive)
+        cand = np.zeros(k + 1, dtype=bool)
+        if hi >= am:
+            cand[am:hi + 1] = True
         pos = np.zeros(k + 1, dtype=bool)
         neg = np.zeros(k + 1, dtype=bool)
         if s['has_covis']:
-            L = min(int(s['leg_start']), k + 1)            # = leg_start (fully observed)
-            pos[:L] = s['pos_pre'][:L]
-            neg[:L] = s['neg_pre'][:L]
-            null_pos = bool(s['null_pos'])
+            L = min(int(s['leg_start']), k + 1)
+            c = np.zeros(k + 1, dtype=np.float32)
+            c[:L] = s['curve'][:L]                         # covis over history; own-leg -> 0
+            pos = cand & (c >= s['pos_hi'])
+            neg = cand & (c <= s['pos_lo'])
         else:
-            idx = np.arange(k + 1)
-            T_A = int(s['T_A']); am = int(s['amargin'])
-            pos = idx >= (T_A - self.glimpse_pos)          # glimpse (already <= k)
-            neg = (idx <= (T_A - self.glimpse_neg)) & (idx >= am)
-            neg &= ~pos                                    # disjoint (holds anyway)
-            null_pos = not bool(pos.any())                 # novel until A is glimpsed
-        return pos, neg, null_pos
+            neg = cand.copy()                              # goalA: never seen -> all-negative
+        null_pos = not bool(pos.any())                     # novel iff no candidate positive
+        return pos, neg, cand, null_pos
 
     def __getitem__(self, index):
-        s = self.samples[index % len(self.samples)]
-        ti = s['traj_idx']
-        goal_step = s['goal_step']
+        s = self.samples[index % len(self.samples)] # fixed goal-sample dict
+        ti = s['traj_idx']            # trajectory index
+        goal_step = s['goal_step']    # fixed last frame of this leg
 
         (
             _camera_intrinsic,
@@ -383,16 +400,16 @@ class MemNav_Dataset(NavDP_Base_Datset):
         T = int(min(traj_len_parquet, dino_cls.shape[0]))
         goal_step = min(goal_step, T - 1)
         # --- sample the current step k inside the goal's own leg [k_lo .. k_hi] ---
-        k_lo = int(s['k_lo'])
         k_hi = min(int(s['k_hi']), goal_step - 1, T - 2)   # keep >=1 forward frame + defensive
-        k_hi = max(k_hi, k_lo)
+        k_lo = min(int(s['k_lo']), k_hi)
         k = int(np.random.randint(k_lo, k_hi + 1))
 
         pred_digit = np.random.randint(2, 8) if self.random_digit else self.pred_digit
 
         # --- retrieval keys: CLS of every observed frame [0..k] ---
         mem_cls = dino_cls[: k + 1].copy()                 # [k+1, 1024]
-        pos_mask, neg_mask, null_pos = self._build_label(s, k)
+        # unified revisit label over candidate region E(k) = [amargin .. k-exclude_recent]
+        pos_mask, neg_mask, cand_mask, null_pos = self._build_label(s, k)
 
         # --- action segment: forward path current(k) -> goal(goal_step) ---
         seg = extrinsics[k : goal_step + 1].copy()         # seg[0] == current frame k
@@ -407,10 +424,11 @@ class MemNav_Dataset(NavDP_Base_Datset):
         return {
             # light tensors
             'mem_cls': torch.tensor(mem_cls, dtype=torch.float32),
-            # multi-positive retrieval label (over real frames [0..k]) + null flag
-            'pos_mask': torch.from_numpy(np.ascontiguousarray(pos_mask)),    # [k+1] bool
-            'neg_mask': torch.from_numpy(np.ascontiguousarray(neg_mask)),    # [k+1] bool
-            'null_pos': torch.tensor(bool(null_pos)),                        # scalar bool
+            # unified retrieval label over candidate region E(k) = [amargin .. k-t]
+            'pos_mask': torch.from_numpy(np.ascontiguousarray(pos_mask)),    # [k+1] bool (covis>=hi in E)
+            'neg_mask': torch.from_numpy(np.ascontiguousarray(neg_mask)),    # [k+1] bool (covis<=lo in E)
+            'cand_mask': torch.from_numpy(np.ascontiguousarray(cand_mask)),  # [k+1] bool (revisit candidates)
+            'null_pos': torch.tensor(bool(null_pos)),                        # scalar bool (novel this k)
             'is_revisit': torch.tensor(float(not null_pos), dtype=torch.float32),
             'pred_actions': torch.tensor(pred_actions, dtype=torch.float32),
             'goal_rel_pose': torch.tensor(goal_rel_pose, dtype=torch.float32),   # aux pose GT
@@ -443,19 +461,22 @@ def memnav_collate_fn(batch):
     mem_mask = torch.zeros(B, Lmax, dtype=torch.bool)
     pos_mask = torch.zeros(B, Lmax, dtype=torch.bool)
     neg_mask = torch.zeros(B, Lmax, dtype=torch.bool)
+    cand_mask = torch.zeros(B, Lmax, dtype=torch.bool)
     for i, b in enumerate(batch):
         Li = lengths[i]
         mem_cls[i, :Li] = b['mem_cls']
         mem_mask[i, :Li] = True
         pos_mask[i, :Li] = b['pos_mask']
         neg_mask[i, :Li] = b['neg_mask']
+        cand_mask[i, :Li] = b['cand_mask']
 
     return {
         'batch_mem_cls':         mem_cls,
         'batch_mem_mask':        mem_mask,
-        # multi-positive retrieval label over real frames [0..Lmax-1] (+ null flag)
+        # unified retrieval label over candidate region E(k) (+ dynamic null/revisit flag)
         'batch_pos_mask':        pos_mask,
         'batch_neg_mask':        neg_mask,
+        'batch_cand_mask':       cand_mask,
         'batch_null_pos':        torch.stack([b['null_pos'] for b in batch]),          # [B] bool
         'batch_is_revisit':      torch.stack([b['is_revisit'] for b in batch]),        # [B] float
         'batch_labels':          torch.stack([b['pred_actions'] for b in batch]),

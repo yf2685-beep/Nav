@@ -17,7 +17,8 @@ class MemNavTrainer(BaseTrainer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
         self.config = config
-        self.w_retr = getattr(config.il, "w_retrieval", 1.0)
+        self.w_retr = getattr(config.il, "w_retrieval", 1.0)     # ranking InfoNCE
+        self.w_gate = getattr(config.il, "w_gate", 1.0)          # revisit/novel BCE
         self.w_aux = getattr(config.il, "w_aux_pose", 0.5)
         self.model_device = (self.model.module if hasattr(self.model, "module") else self.model).device
         print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] Model device: {self.model_device}")
@@ -33,43 +34,57 @@ class MemNavTrainer(BaseTrainer):
         mg_loss = (fwd["noise_mg"] - noise).square().mean()
         action_loss = 0.5 * ng_loss + 0.5 * mg_loss
 
-        # --- retrieval CE: target = k_goal (seen) / null (unseen) ---
-        logits = fwd["ret_logits"]                               # [B, L+1] (last = null)
-        is_seen = inputs["batch_is_seen"].to(dev).bool()         # [B]
-        null_idx = logits.shape[1] - 1
-        ret_target = inputs["batch_retrieval_target"].to(dev).clone()
-        ret_target = torch.where(is_seen, ret_target, ret_target.new_full((), null_idx))
-        retrieval_loss = F.cross_entropy(logits, ret_target)
+        # --- retrieval: DECOUPLED ranking (InfoNCE) + revisit gate (BCE) ---
+        # A joint softmax with a null slot collapses to always-null (the easy shortcut),
+        # so the two jobs are split: (a) InfoNCE ranks the true co-visible frame above the
+        # other candidates on REVISIT rows; (b) an affine-on-max-cosine gate (in the head)
+        # is trained by BCE to decide revisit vs novel. The candidate set E(k) already
+        # excludes the recent approach window, which is what makes both signals separable.
+        ret_logits = fwd["ret_logits"]                           # [B, L] cos/temp over candidates
+        gate_logit = fwd["gate_logit"]                           # [B] pre-sigmoid revisit logit
+        pos = inputs["batch_pos_mask"].to(dev).bool()            # [B, L]
+        neg = inputs["batch_neg_mask"].to(dev).bool()            # [B, L]
+        is_rev = inputs["batch_is_revisit"].to(dev)              # [B] float (1=revisit, 0=novel)
+        NEG_INF = torch.finfo(ret_logits.dtype).min
+        # (a) ranking: -log Σ_pos e^s / Σ_{pos∪neg} e^s, over revisit rows carrying a negative
+        lse_pn = ret_logits.masked_fill(~(pos | neg), NEG_INF).logsumexp(-1)
+        lse_p = ret_logits.masked_fill(~pos, NEG_INF).logsumexp(-1)
+        rank_rows = pos.any(-1) & neg.any(-1)                    # [B] revisit rows w/ contrastive signal
+        rank_loss = ((lse_pn - lse_p) * rank_rows).sum() / rank_rows.sum().clamp(min=1.0)
+        # (b) gate BCE over ALL rows; pos_weight offsets the novel-heavy class mix
+        n_rev = is_rev.sum()
+        pos_weight = ((1.0 - is_rev).sum() / n_rev.clamp(min=1.0)).clamp(0.1, 10.0)
+        gate_loss = F.binary_cross_entropy_with_logits(gate_logit, is_rev, pos_weight=pos_weight)
 
-        # --- aux pose (x,y,θ): MSE on SEEN samples only (revisit is the active branch) ---
+        # --- aux pose (x,y,θ): MSE on REVISIT rows only (relocalization branch) ---
         gt_pose = inputs["batch_goal_rel_pose"].to(dev)          # [B,3]
-        seen_f = is_seen.float()
+        revisit = is_rev                                         # 1 = goal is in memory
         per = (fwd["aux_pose"] - gt_pose).square().mean(-1)      # [B]
-        aux_loss = (per * seen_f).sum() / seen_f.sum().clamp(min=1.0)
+        aux_loss = (per * revisit).sum() / revisit.sum().clamp(min=1.0)
 
-        loss = action_loss + self.w_retr * retrieval_loss + self.w_aux * aux_loss
+        loss = (action_loss + self.w_retr * rank_loss
+                + self.w_gate * gate_loss + self.w_aux * aux_loss)
 
         with torch.no_grad():
-            ret_acc = (logits.argmax(-1) == ret_target).float().mean()
-            # --- gate seen/unseen separation + seen-only retrieval match acc (key diagnostics) ---
-            gate = fwd["revisit_gate"]                            # [B] P(some real match): want HIGH seen / LOW unseen
-            ns = seen_f.sum().clamp(min=1.0)
-            nu = (1.0 - seen_f).sum().clamp(min=1.0)
-            gate_seen = (gate * seen_f).sum() / ns                # → 1 (visited)
-            gate_unseen = (gate * (1.0 - seen_f)).sum() / nu      # → 0 (unseen)
-            gate_sep = gate_seen - gate_unseen                    # → large +  (the separation)
-            correct = (logits.argmax(-1) == ret_target).float()
-            seen_match = (correct * seen_f).sum() / ns            # found the right frame (seen)
-            unseen_null = (correct * (1.0 - seen_f)).sum() / nu   # correctly chose null (unseen)
+            gate_prob = torch.sigmoid(gate_logit)                # [B] P(revisit)
+            ns = revisit.sum().clamp(min=1.0)
+            nu = (1.0 - revisit).sum().clamp(min=1.0)
+            gate_seen = (gate_prob * revisit).sum() / ns          # → 1 (visited)
+            gate_unseen = (gate_prob * (1.0 - revisit)).sum() / nu  # → 0 (novel)
+            gate_sep = gate_seen - gate_unseen                    # → large + (the separation)
+            gate_acc = ((gate_prob > 0.5).float() == revisit).float().mean()
+            pred = ret_logits.argmax(-1)                          # [B] best candidate frame
+            hit = pos.gather(1, pred[:, None]).squeeze(1).float()
+            seen_match = (hit * revisit).sum() / ns               # retrieved the true frame (revisit)
         outputs = dict(loss=loss, action_loss=action_loss, ng_loss=ng_loss, mg_loss=mg_loss,
-                       retrieval_loss=retrieval_loss, aux_loss=aux_loss, ret_acc=ret_acc,
+                       retrieval_loss=rank_loss, gate_loss=gate_loss, aux_loss=aux_loss,
                        gate_seen=gate_seen, gate_unseen=gate_unseen, gate_sep=gate_sep,
-                       seen_match_acc=seen_match, unseen_null_acc=unseen_null)
+                       gate_acc=gate_acc, seen_match_acc=seen_match)
         if (dist.get_rank() if dist.is_initialized() else 0) == 0:
             print(f"[Step {self.state.global_step}] loss={loss.item():.4f} act={action_loss.item():.4f} "
-                  f"retr={retrieval_loss.item():.4f}(acc {ret_acc.item():.2f}) aux={aux_loss.item():.4f} | "
-                  f"gate seen={gate_seen.item():.2f} unseen={gate_unseen.item():.2f} sep={gate_sep.item():+.2f} | "
-                  f"match seen={seen_match.item():.2f} unseen_null={unseen_null.item():.2f}")
+                  f"rank={rank_loss.item():.4f} gate={gate_loss.item():.4f} aux={aux_loss.item():.4f} | "
+                  f"gate seen={gate_seen.item():.2f} unseen={gate_unseen.item():.2f} sep={gate_sep.item():+.2f} "
+                  f"acc={gate_acc.item():.2f} | match seen={seen_match.item():.2f}")
 
         # Per-component metrics → wandb/tb. self.log is rank-0-only inside HF Trainer;
         # gate by logging_steps to match train/loss cadence and avoid extra .item() syncs.
@@ -78,14 +93,14 @@ class MemNavTrainer(BaseTrainer):
                 'train/action_loss': action_loss.item(),
                 'train/ng_loss': ng_loss.item(),
                 'train/mg_loss': mg_loss.item(),
-                'train/retrieval_loss': retrieval_loss.item(),
+                'train/retrieval_loss': rank_loss.item(),
+                'train/gate_loss': gate_loss.item(),
                 'train/aux_loss': aux_loss.item(),
-                'train/ret_acc': ret_acc.item(),
+                'train/gate_acc': gate_acc.item(),
                 'train/gate_seen': gate_seen.item(),
                 'train/gate_unseen': gate_unseen.item(),
                 'train/gate_sep': gate_sep.item(),
                 'train/seen_match_acc': seen_match.item(),
-                'train/unseen_null_acc': unseen_null.item(),
             }
             if dev.type == 'cuda':
                 # Peak since previous logging_step, in GiB. Reset right after so the

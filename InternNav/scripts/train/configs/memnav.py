@@ -19,6 +19,14 @@ _LINGBOT_WEIGHTS = os.environ.get(
     'LINGBOT_WEIGHTS',
     '/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map/weights/lingbot-map-long.pt',
 )
+# Frames may live in a read-only squashfs overlay (mp3d pt1.sqf) while caches are
+# written to a SEPARATE writable tree — MEMNAV_FEATURE_ROOT points at that tree
+# (None = old behavior: cache sits beside the frames). window/num_scale/max_frame_num
+# MUST match how the caches were precomputed (mp3d: window=32, num_scale=8, mfn=2048).
+_FEATURE_ROOT = os.environ.get('MEMNAV_FEATURE_ROOT') or None
+_WINDOW_SIZE = int(os.environ.get('MEMNAV_WINDOW', '32'))
+_NUM_SCALE = int(os.environ.get('MEMNAV_NUM_SCALE', '8'))
+_MAX_FRAME_NUM = int(os.environ.get('MEMNAV_MAX_FRAME_NUM', '2048'))
 
 memnav_exp_cfg = ExpCfg(
     name='memnav_train',
@@ -56,10 +64,17 @@ memnav_exp_cfg = ExpCfg(
         report_to=os.environ.get('MEMNAV_REPORT_TO', 'wandb'),
         # data + frozen-LingBot paths (override via MEMNAV_ROOT_DIR / LINGBOT_REPO / LINGBOT_WEIGHTS)
         root_dir=_ROOT_DIR,
+        feature_root=_FEATURE_ROOT,
         lingbot_repo=_LINGBOT_REPO,
         lingbot_weights=_LINGBOT_WEIGHTS,
         image_size=518,
         random_digit=False,
+        # memory-partition geometry — MUST match the precompute (mp3d: 32/8/2048).
+        # Read by MemNav_Dataset (window_size/num_scale) and LingBotStream (window/
+        # num_scale/max_frame_num) so training reproduces the cached streaming exactly.
+        window_size=_WINDOW_SIZE,
+        num_scale=_NUM_SCALE,
+        max_frame_num=_MAX_FRAME_NUM,
         # policy / diffusion
         predict_size=24,
         temporal_depth=8,

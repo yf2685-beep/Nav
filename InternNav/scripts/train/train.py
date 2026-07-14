@@ -254,6 +254,9 @@ def main(config, model_class, model_config_class):
                 predict_size=config.il.predict_size,
                 image_size=config.il.image_size,
                 lingbot_repo=config.il.lingbot_repo,
+                feature_root=getattr(config.il, 'feature_root', None),
+                window_size=getattr(config.il, 'window_size', 8),
+                num_scale=getattr(config.il, 'num_scale', 8),
             )
         else:
             if '3dgs' in config.il.lmdb_features_dir or '3dgs' in config.il.lmdb_features_dir:

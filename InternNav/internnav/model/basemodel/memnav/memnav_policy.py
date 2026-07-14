@@ -31,39 +31,55 @@ from internnav.model.encoder.navdp_backbone import (
 # (2.retrieval) Target-image retrieval over dino_cls — trainable, supervised
 # --------------------------------------------------------------------------- #
 class RetrievalHead(nn.Module):
-    """goal_cls vs mem_cls (history CLS) → (match_idx, revisit_gate, logits).
+    """goal_cls vs mem_cls (history CLS) over the revisit CANDIDATE set → decoupled
+    ranking logits + a separate revisit/novel gate.
 
-    A learnable projection + temperature in a matching space, plus a **learnable
-    null** candidate so an *unseen* goal (no real match) lands on null → low gate.
-      - match_idx    : argmax real frame (discrete; drives LingBotStream.goal_append)
-      - revisit_gate : 1 − P(null)  (differentiable; blends (2) vs (3))
-      - logits       : [B, L+1] (last = null) for the retrieval-CE loss
-                       (target = k_goal for seen, = L (null) for unseen)
+    Two jobs, DECOUPLED (a joint softmax with a null slot collapses to always-null):
+      * RANKING  : cosine(goal, mem)/temp over candidate frames -> ret_logits [B,L].
+                   Multi-positive InfoNCE (revisit rows) is applied on these.
+      * GATE     : the revisit/novel decision is an AFFINE readout of the single most
+                   similar candidate: g = a·max_i cos_i + b -> BCE(sigmoid(g), revisit).
+                   (Probe: absolute top-1 cosine over the candidate region separates
+                   revisit vs novel at AUC≈0.91; within-scene contrast / peak-sharpness
+                   do NOT — so gate on the max, not a shape statistic.)
+    The candidate set (mem_mask here = cand_mask from the loader) already excludes the
+    recent approach window + <anchor_margin, which is what makes max-cos discriminative.
+
+      - match_idx : argmax candidate frame (drives LingBotStream.goal_append)
+      - gate_logit: [B] pre-sigmoid revisit logit (BCE target)
+      - ret_logits: [B, L] cosine/temp over candidates (-inf elsewhere) for InfoNCE
     """
 
     def __init__(self, dino_dim=1024, proj_dim=256, temp_init=0.07):
         super().__init__()
         self.proj_goal = nn.Linear(dino_dim, proj_dim)
         self.proj_mem = nn.Linear(dino_dim, proj_dim)
-        self.null_key = nn.Parameter(torch.randn(proj_dim) * 0.02)
         self.log_temp = nn.Parameter(torch.tensor(float(np.log(temp_init))))
+        # affine gate on the max candidate cosine: sigmoid(a·max_cos + b) = P(revisit)
+        self.gate_a = nn.Parameter(torch.tensor(10.0))
+        self.gate_b = nn.Parameter(torch.tensor(-8.0))
 
-    def forward(self, goal_cls, mem_cls, mem_mask):
-        """goal_cls [B,D'], mem_cls [B,L,D'], mem_mask [B,L] bool."""
+    def forward(self, goal_cls, mem_cls, cand_mask):
+        """goal_cls [B,D'], mem_cls [B,L,D'], cand_mask [B,L] bool (revisit candidates)."""
         gq = F.normalize(self.proj_goal(goal_cls), dim=-1)        # [B,d]
         mk = F.normalize(self.proj_mem(mem_cls), dim=-1)          # [B,L,d]
-        nk = F.normalize(self.null_key, dim=-1)                   # [d]
         temp = self.log_temp.exp().clamp(0.01, 1.0)
 
-        scores = (gq.unsqueeze(1) * mk).sum(-1) / temp           # [B,L]
-        scores = scores.masked_fill(~mem_mask, float("-inf"))    # ignore padding
-        null = (gq * nk).sum(-1, keepdim=True) / temp            # [B,1]
-        logits = torch.cat([scores, null], dim=1)               # [B,L+1] (last = null)
+        cos = (gq.unsqueeze(1) * mk).sum(-1)                      # [B,L] raw cosine (finite)
+        NEG_INF = torch.finfo(cos.dtype).min
+        # mask AFTER dividing by temp with a FINITE floor: putting -inf through /temp
+        # makes 0*inf = nan flow into log_temp on backward (masked_fill zeros the upstream
+        # grad, but the local d(-inf/temp)/dtemp = inf).
+        ret_logits = (cos / temp).masked_fill(~cand_mask, NEG_INF)  # ranking logits over candidates
 
-        prob = logits.softmax(-1)
-        revisit_gate = 1.0 - prob[:, -1]                         # P(some real match)
-        match_idx = scores.argmax(-1)                           # best real frame
-        return match_idx, revisit_gate, logits
+        # gate feature = max candidate cosine (finite floor for all-masked rows)
+        has_cand = cand_mask.any(-1)                             # [B]
+        max_cos = cos.masked_fill(~cand_mask, -1.0).max(-1).values  # [B] in [-1,1]
+        max_cos = torch.where(has_cand, max_cos, max_cos.new_full((), -1.0))
+        gate_logit = self.gate_a * max_cos + self.gate_b        # [B]
+
+        match_idx = ret_logits.argmax(-1)                       # best candidate frame
+        return match_idx, gate_logit, ret_logits
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +270,7 @@ class MemNavNet(nn.Module):
         return dict(
             noise_ng=noise_ng, noise_mg=noise_mg, noise=noise,
             aux_pose=aux_pose, ret_logits=enc["ret_logits"], revisit_gate=gate,
+            gate_logit=enc["gate_logit"],
         )
 
     @torch.no_grad()
@@ -283,11 +300,19 @@ class MemNavNet(nn.Module):
         readouts the trainable head consumes.
         """
         dev = self.device
-        goal_cls = batch["batch_goal_cls"].to(dev)
+        # goal_cls: real goal images (goal_{j}.jpg) have no cached CLS, so compute it
+        # from the goal image via the frozen context-free DINO trunk (same space as the
+        # cached per-frame dino_cls). Fall back to a provided batch_goal_cls (old path /
+        # smoke tests where the goal is a trajectory frame).
+        if batch.get("batch_goal_cls") is not None:
+            goal_cls = batch["batch_goal_cls"].to(dev)
+        else:
+            goal_cls = self.lingbot.dino(batch["batch_goal_image"].to(dev))["cls"]  # [B, D']
         mem_cls = batch["batch_mem_cls"].to(dev)
-        mem_mask = batch["batch_mem_mask"].to(dev)
-        # (trainable) retrieval — match index + gate + logits
-        match_idx, revisit_gate, ret_logits = self.retrieval(goal_cls, mem_cls, mem_mask)
+        cand_mask = batch["batch_cand_mask"].to(dev)   # revisit candidates E(k) = [amargin..k-t]
+        # (trainable) retrieval — match index + gate logit + ranking logits (over candidates)
+        match_idx, gate_logit, ret_logits = self.retrieval(goal_cls, mem_cls, cand_mask)
+        revisit_gate = torch.sigmoid(gate_logit)       # P(revisit) for the decoder soft-gate
 
         B = len(batch["cache_paths"])
         W, lo = self.window, self.num_scale + self.window - 1
@@ -320,7 +345,8 @@ class MemNavNet(nn.Module):
             depth_feat=torch.stack(dfeat_t), # [B, Pf, Cd]   depth-head geometry
             cur_pose=torch.stack(curp),      # [B, 9]        current absolute camera pose (map frame)
             goal_pose=torch.stack(goalp),    # [B, 9]        goal absolute camera pose (map frame)
-            match_idx=match_idx, revisit_gate=revisit_gate, ret_logits=ret_logits,
+            match_idx=match_idx, revisit_gate=revisit_gate, gate_logit=gate_logit,
+            ret_logits=ret_logits,
         )
 
 
@@ -365,6 +391,12 @@ class MemNavPolicy(PreTrainedModel):
         lingbot_kwargs = {}
         if il.get('lingbot_repo'):    lingbot_kwargs['lingbot_repo'] = il['lingbot_repo']
         if il.get('lingbot_weights'): lingbot_kwargs['weights'] = il['lingbot_weights']
+        # memory-partition geometry — MUST match the precompute + dataset (mp3d: 32/8/2048).
+        # LingBotStream sets kv_cache_sliding_window=window, so window here == the precompute
+        # --kv_cache_sliding_window; max_frame_num sizes the 3D-RoPE table (long 3leg episodes).
+        if il.get('window_size') is not None:   lingbot_kwargs['window'] = il['window_size']
+        if il.get('num_scale') is not None:     lingbot_kwargs['num_scale'] = il['num_scale']
+        if il.get('max_frame_num') is not None: lingbot_kwargs['max_frame_num'] = il['max_frame_num']
         self.core = MemNavNet(
             token_dim=il['token_dim'], heads=il['heads'], predict_size=il['predict_size'],
             temporal_depth=il['temporal_depth'], num_diffusion_iters=il.get('num_diffusion_iters', 10),
@@ -382,18 +414,25 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     B, L, D, P = 4, 60, 1024, 1369
-    # retrieval smoke
+    # retrieval smoke: ranking logits over candidates + affine gate on max-cos
     rh = RetrievalHead()
     goal_cls = torch.randn(B, D)
     mem_cls = torch.randn(B, L, D)
-    mem_mask = torch.ones(B, L, dtype=torch.bool)
-    mem_mask[0, 40:] = False  # pad sample 0
-    m, gate, logits = rh(goal_cls, mem_cls, mem_mask)
+    cand_mask = torch.ones(B, L, dtype=torch.bool)
+    cand_mask[0, 40:] = False  # sample 0: fewer candidates
+    cand_mask[1, :] = False    # sample 1: no candidate -> novel (gate floor)
+    m, gate_logit, logits = rh(goal_cls, mem_cls, cand_mask)
+    gate = torch.sigmoid(gate_logit)
     print(f"RetrievalHead: match_idx={m.tolist()} gate={[round(x,3) for x in gate.tolist()]} logits={tuple(logits.shape)}")
-    # retrieval CE (seen target=k_goal, unseen target=L=null)
-    target = torch.tensor([12, 60, 5, 33])   # sample 1 = unseen -> null index L=60
-    ce = F.cross_entropy(logits, target)
-    print(f"  retrieval CE (sanity) = {ce.item():.3f}; grad ok = {torch.autograd.grad(ce, rh.log_temp, retain_graph=True)[0] is not None}")
+    # decoupled losses: InfoNCE (ranking) + BCE (gate)
+    pos = torch.zeros(B, L, dtype=torch.bool); pos[[0, 2, 3], [12, 5, 33]] = True
+    neg = cand_mask & ~pos
+    rank = (logits.masked_fill(~(pos | neg), float("-inf")).logsumexp(-1)
+            - logits.masked_fill(~pos, float("-inf")).logsumexp(-1))[[0, 2, 3]].mean()
+    is_rev = torch.tensor([1.0, 0.0, 1.0, 1.0])
+    gate_ce = F.binary_cross_entropy_with_logits(gate_logit, is_rev)
+    print(f"  rank InfoNCE={rank.item():.3f}  gate BCE={gate_ce.item():.3f}  "
+          f"grad ok={torch.autograd.grad(rank + gate_ce, rh.log_temp, retain_graph=True)[0] is not None}")
 
     # novel branch smoke (early fusion on raw images)
     nb = NovelBranch(device="cuda").to("cuda")

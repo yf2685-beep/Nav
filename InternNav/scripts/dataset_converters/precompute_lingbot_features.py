@@ -84,6 +84,17 @@ def find_trajectories(root_dirs):
     return trajectories
 
 
+def _atomic_savez(path, **arrays):
+    """np.savez to a sibling .tmp then os.replace(path) so the final file is never
+    partially written. Writing to an open handle avoids numpy's auto ".npz" suffixing."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        np.savez(f, **arrays)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 # --------------------------------------------------------------------------- #
 # Model construction (mirror demo.py:load_model)
 # --------------------------------------------------------------------------- #
@@ -107,6 +118,38 @@ def build_model(args, device):
         state_dict = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         print(f"  loaded weights: {len(missing)} missing, {len(unexpected)} unexpected keys")
+
+    # --- 3D-RoPE frame-table extension --------------------------------------- #
+    # WanRotaryPosEmbed precomputes an ANALYTIC (untrained) frequency table of shape
+    # [max_seq_len, ...]; forward() slices it by global frame index, so a trajectory
+    # with more than max_seq_len frames slices past the end and silently returns too
+    # few rows -> shape-mismatch crash. The aggregator sizes its table to max_frame_num,
+    # but the camera head HARDCODES max_seq_len=1024 (ignores max_frame_num). Rebuild
+    # every table shorter than max_frame_num up to max_frame_num.
+    #   * Safe to load: the table is a plain attribute, not a registered buffer, so it is
+    #     not in the checkpoint (load is 0-missing/0-unexpected regardless of size).
+    #   * Backward-compatible: row i depends only on i, so extending only APPENDS rows
+    #     >= old_len; every <=old_len trajectory reads identical rows. We ASSERT the
+    #     overlap is bit-identical (proves theta==10000, the value both call sites use)
+    #     so short-episode caches are guaranteed unchanged.
+    from lingbot_map.layers.rope import WanRotaryPosEmbed, get_1d_rotary_pos_embed
+    n_ext = 0
+    for mod in model.modules():
+        if isinstance(mod, WanRotaryPosEmbed) and mod.max_seq_len < args.max_frame_num:
+            t_dim, h_dim, w_dim = mod.fhw_dim
+            old = mod.freqs
+            new = torch.cat([get_1d_rotary_pos_embed(
+                                d, args.max_frame_num, 10000.0, use_real=False,
+                                repeat_interleave_real=False, freqs_dtype=torch.float64)
+                             for d in (t_dim, h_dim, w_dim)], dim=1)
+            assert torch.allclose(new[:old.shape[0]].to(old.dtype), old.to(new.dtype).to(old.dtype),
+                                  atol=1e-6), "RoPE table rebuild changed the overlap region"
+            mod.freqs = new
+            mod.max_seq_len = args.max_frame_num
+            n_ext += 1
+    if n_ext:
+        print(f"  extended {n_ext} WanRotaryPosEmbed table(s) -> {args.max_frame_num} frames "
+              f"(overlap verified bit-identical)")
     return model.to(device).eval()
 
 
@@ -252,6 +295,10 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out_name", default="lingbot_cache.npz",
                     help="Output filename written next to each trajectory's videos/chunk-000/.")
+    ap.add_argument("--out_root", default="",
+                    help="If set, write caches under out_root mirroring each trajectory's path "
+                         "relative to root_dirs (instead of beside the frames). Required when "
+                         "root_dirs is a read-only squashfs mount.")
     ap.add_argument("--cam_out_name", default="lingbot_cam_cache.npz",
                     help="Camera-head KV cache filename (cam_k/cam_v/cam_meta).")
     ap.add_argument("--cam_only", action="store_true",
@@ -301,8 +348,14 @@ def main():
     n_done, n_skip, n_err = 0, 0, 0
     for traj_dir, rgb_dir, rgb_paths in tqdm(trajectories, desc="trajectories"):
         chunk_dir = os.path.dirname(rgb_dir.rstrip("/"))
-        out_path = os.path.join(chunk_dir, args.out_name)
-        cam_path = os.path.join(chunk_dir, args.cam_out_name)
+        if args.out_root:
+            rel = os.path.relpath(chunk_dir, args.root_dirs)
+            dst_dir = os.path.join(args.out_root, rel)
+            os.makedirs(dst_dir, exist_ok=True)
+        else:
+            dst_dir = chunk_dir
+        out_path = os.path.join(dst_dir, args.out_name)
+        cam_path = os.path.join(dst_dir, args.cam_out_name)
         gate_path = cam_path if args.cam_only else out_path
         if os.path.exists(gate_path) and not args.overwrite:
             n_skip += 1
@@ -322,8 +375,12 @@ def main():
                 )
             assert np.isfinite(feats["cam_k"]).all(), "non-finite cam_k"
             # Camera-head cache (always) — small; np.savez (ZIP_STORED) avoids slow deflate.
-            np.savez(cam_path, cam_k=feats["cam_k"], cam_v=feats["cam_v"],
-                     cam_pose_enc=feats["cam_pose_enc"], cam_meta=feats["cam_meta"])
+            # ATOMIC write: savez into a .tmp *file handle* (writing to a handle skips numpy's
+            # ".npz" suffix munging), fsync, then os.replace. A crash mid-write (node death,
+            # timeout, OOM) leaves only a .tmp the skip-if-exists gate ignores — never a
+            # truncated final cache that would be silently treated as "done".
+            _atomic_savez(cam_path, cam_k=feats["cam_k"], cam_v=feats["cam_v"],
+                          cam_pose_enc=feats["cam_pose_enc"], cam_meta=feats["cam_meta"])
             if not args.cam_only:
                 assert np.isfinite(feats["dino_cls"]).all(), "non-finite dino_cls"
                 save_kwargs = dict(
@@ -335,7 +392,8 @@ def main():
                     assert np.isfinite(feats["scale_k"]).all(), "non-finite scale_k"
                     save_kwargs["scale_k"] = feats["scale_k"]
                     save_kwargs["scale_v"] = feats["scale_v"]
-                np.savez(out_path, **save_kwargs)
+                # out_path (gate file) written LAST + atomically, so it appears only once complete.
+                _atomic_savez(out_path, **save_kwargs)
             n_done += 1
         except Exception as e:  # noqa: BLE001 — keep going, report at the end
             n_err += 1
