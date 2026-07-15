@@ -292,7 +292,16 @@ class MemNavNet(nn.Module):
                 .permute(1, 2, 0, 3, 4).contiguous()
         cc = np.load(path.replace("lingbot_cache.npz", "lingbot_cam_cache.npz"))
         ck, cv = LingBotStream._cam_to_device(cc["cam_k"], cc["cam_v"], self.device)
-        return dict(scale_k=sk, scale_v=sv, anchor_k=ak, anchor_v=av, cam_k=ck, cam_v=cv)
+        # cam_pose_enc [S,9]: the frozen camera head's own pose for every REAL trajectory
+        # frame, captured during precompute's genuinely continuous stream (extract_trajectory)
+        # — used directly for cur_pose (see encode_memory) instead of re-deriving it from a
+        # window_forward recompute, which cold-starts at k-W+1 with no real predecessors and
+        # is measurably worse (diag_lingbot_pose_accuracy.py: ATE 3.35m vs 0.04m on a 2-leg
+        # smoke episode). goal_pose still needs a live camera_pose() call — the goal image is
+        # newly inserted, not a frame this array has an entry for.
+        cam_pose_enc = torch.as_tensor(cc["cam_pose_enc"], device=self.device, dtype=torch.float32)
+        return dict(scale_k=sk, scale_v=sv, anchor_k=ak, anchor_v=av, cam_k=ck, cam_v=cv,
+                   cam_pose_enc=cam_pose_enc)
 
     def encode_memory(self, batch):
         """Frozen front-end orchestration. Retrieval (trainable, batched) picks the
@@ -344,7 +353,9 @@ class MemNavNet(nn.Module):
                 wt, cur_agg, psi = self.lingbot.window_forward(cache, win_img, k, return_multilayer=True)
                 cur = wt[-1]                                                        # [P, 2C]
                 dfeat = self.lingbot.depth_feature(cur_agg, win_img[-1:][None], psi)  # [Pf, Cd]
-                cur_pose = self.lingbot.camera_pose(ck, cv, k, cur_agg)[-1]         # [9] current abs pose
+                # cur_pose: read the precomputed continuous-stream pose directly (exact,
+                # no cold-start reconstruction) — k is always a real trajectory frame.
+                cur_pose = cache["cam_pose_enc"][k]                                  # [9] current abs pose
                 # (2) revisit: goal_append at the anchor frame (clamped valid) -> goal abs pose
                 m = int(anchor[b].clamp(lo, k - 1).item())
                 mw = self.lingbot.load_images([os.path.join(rgb_dir, f"{i}.jpg")
