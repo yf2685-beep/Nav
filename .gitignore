@@ -106,3 +106,7 @@ NavDP/baselines/memnav/lingbot-map/
 # --- Large local data trees (multi-GB; never push) ---
 NavDP/assets/scenes/
 NavDP/checkpoints/
+
+# --- Workspace-local repos and generated MemNav diagnostics ---
+/IsaacLab/
+/memnav_viz/
