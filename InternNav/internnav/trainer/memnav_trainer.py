@@ -33,13 +33,40 @@ class MemNavTrainer(BaseTrainer):
         mg_loss = (fwd["noise_mg"] - noise).square().mean()
         action_loss = 0.5 * ng_loss + 0.5 * mg_loss
 
-        # --- retrieval CE: target = k_goal (seen) / null (unseen) ---
+        # --- retrieval loss: windowed soft-label CE (seen) + hard null (unseen) + recall bias ---
+        # Adjacent trajectory frames are near-identical, so a hard exact-index CE is nearly
+        # unlearnable (exact-match sat at 0.00) and pushes the head toward null. Instead we credit
+        # a neighbourhood ±W of the true goal frame (triangular soft target), and add a recall
+        # penalty that pushes SEEN samples off the null so the memory branch actually fires
+        # ("更容易采取之前的图片"). Unseen goals keep a hard null target.
         logits = fwd["ret_logits"]                               # [B, L+1] (last = null)
         is_seen = inputs["batch_is_seen"].to(dev).bool()         # [B]
-        null_idx = logits.shape[1] - 1
+        mem_mask = inputs["batch_mem_mask"].to(dev).bool()       # [B, L] valid history frames
+        Lp1 = logits.shape[1]
+        L = Lp1 - 1
+        null_idx = L
+        # hard target kept for the diagnostics below (ret_acc / seen_match)
         ret_target = inputs["batch_retrieval_target"].to(dev).clone()
         ret_target = torch.where(is_seen, ret_target, ret_target.new_full((), null_idx))
-        retrieval_loss = F.cross_entropy(logits, ret_target)
+        # windowed soft target over the real frames
+        Wm = getattr(self.config.il, "retrieval_window", 2)
+        tgt_idx = inputs["batch_retrieval_target"].to(dev).clamp(min=0)         # k_goal (seen)
+        ar = torch.arange(L, device=dev).unsqueeze(0)                          # [1, L]
+        d = (ar - tgt_idx.unsqueeze(1)).abs().float()                          # [B, L]
+        win = (d <= Wm).float() * mem_mask.float() * (1.0 - d / (Wm + 1))      # in-window, valid, triangular
+        win = win / win.sum(1, keepdim=True).clamp(min=1e-6)                   # per-sample distribution
+        soft = torch.zeros_like(logits)
+        soft[:, :L] = win
+        soft[~is_seen] = 0.0
+        soft[~is_seen, null_idx] = 1.0                                         # unseen -> null (hard)
+        logp = F.log_softmax(logits, dim=1)
+        # padded frames have logit -inf -> logp -inf; soft is 0 there, and 0*-inf = NaN.
+        # only accumulate where soft>0 (valid window / null) to keep the CE finite.
+        term = torch.where(soft > 0, soft * logp, torch.zeros_like(logp))
+        retrieval_loss = -term.sum(1).mean()
+        w_recall = getattr(self.config.il, "w_retrieval_recall", 0.5)
+        if is_seen.any():
+            retrieval_loss = retrieval_loss + w_recall * logits.softmax(1)[is_seen, null_idx].mean()
 
         # --- aux pose (x,y,θ): MSE on SEEN samples only (revisit is the active branch) ---
         gt_pose = inputs["batch_goal_rel_pose"].to(dev)          # [B,3]
@@ -58,8 +85,15 @@ class MemNavTrainer(BaseTrainer):
             gate_seen = (gate * seen_f).sum() / ns                # → 1 (visited)
             gate_unseen = (gate * (1.0 - seen_f)).sum() / nu      # → 0 (unseen)
             gate_sep = gate_seen - gate_unseen                    # → large +  (the separation)
-            correct = (logits.argmax(-1) == ret_target).float()
-            seen_match = (correct * seen_f).sum() / ns            # found the right frame (seen)
+            correct = (logits.argmax(-1) == ret_target).float()  # exact index match (used for unseen->null)
+            # seen "similar" match: adjacent trajectory frames are near-identical, so requiring the
+            # argmax to hit the EXACT goal index is overly strict (that metric sat at 0.00). Instead,
+            # count a seen retrieval as correct when the argmax lands on a REAL frame (not null) within
+            # ±match_window of the true goal frame. match_window is configurable (default ±2).
+            match_w = getattr(self.config.il, "match_window", 2)
+            pred = logits.argmax(-1)
+            seen_hit = ((pred != null_idx) & ((pred - ret_target).abs() <= match_w)).float()
+            seen_match = (seen_hit * seen_f).sum() / ns           # found a frame within ±W of the goal (seen)
             unseen_null = (correct * (1.0 - seen_f)).sum() / nu   # correctly chose null (unseen)
         outputs = dict(loss=loss, action_loss=action_loss, ng_loss=ng_loss, mg_loss=mg_loss,
                        retrieval_loss=retrieval_loss, aux_loss=aux_loss, ret_acc=ret_acc,
@@ -69,7 +103,7 @@ class MemNavTrainer(BaseTrainer):
             print(f"[Step {self.state.global_step}] loss={loss.item():.4f} act={action_loss.item():.4f} "
                   f"retr={retrieval_loss.item():.4f}(acc {ret_acc.item():.2f}) aux={aux_loss.item():.4f} | "
                   f"gate seen={gate_seen.item():.2f} unseen={gate_unseen.item():.2f} sep={gate_sep.item():+.2f} | "
-                  f"match seen={seen_match.item():.2f} unseen_null={unseen_null.item():.2f}")
+                  f"match seen(±{match_w})={seen_match.item():.2f} unseen_null={unseen_null.item():.2f}")
         return (loss, outputs) if return_outputs else loss
 
     # ------------------------------------------------------------------ #

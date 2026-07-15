@@ -26,7 +26,7 @@ memnav_exp_cfg = ExpCfg(
         step_interval=50,
     ),
     il=IlCfg(
-        epochs=1000,
+        epochs=60,
         batch_size=8,
         lr=1e-4,
         num_workers=4,
@@ -37,10 +37,10 @@ memnav_exp_cfg = ExpCfg(
         load_from_ckpt=False,
         ckpt_to_load='',
         report_to='tensorboard',
-        # data + frozen-LingBot paths  (OVERRIDE THESE ON HPC)
-        root_dir='/home/asus/Research/datasets/InternData-N1/vln_n1/traj_data',
-        lingbot_repo='/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map',
-        lingbot_weights='/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map/weights/lingbot-map-long.pt',
+        # data + frozen-LingBot paths  (OVERRIDE THESE ON HPC) — set for machine 127
+        root_dir='/home/nyuair/data-001/InternData-N1/v0.1-mini/vln_n1/traj_data_navdp',
+        lingbot_repo='/home/nyuair/yuxuan/lingbot-map',
+        lingbot_weights='/home/nyuair/yuxuan/lingbot-map/weights/lingbot-map-long.pt',
         image_size=518,
         random_digit=False,
         # policy / diffusion
