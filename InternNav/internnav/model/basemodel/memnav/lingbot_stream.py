@@ -365,6 +365,35 @@ class LingBotStream(nn.Module):
             self.window_forward(cache, match_window_imgs, int(match_idx))
         return self._stream_one(goal_img, return_agg=return_agg)   # goal at time (m+1) or (k+1)
 
+    @torch.no_grad()
+    def goal_append_warm(self, goal_img, cache, m, rgb_dir, warm, return_agg=False):
+        """Like goal_append's revisit path, but recomputes a DEEP warm-up window
+        ``[max(num_scale, m-warm+1) .. m]`` instead of just the nominal ``self.window``
+        frames, before streaming the goal at ``m+1``.
+
+        window_forward's cold start at the nominal window boundary starves the goal's pose
+        estimate — the first live-recomputed frame (and everything causally downstream of
+        it, including the goal) has no real predecessors, only the injected specials-only
+        history. Empirically (scripts/diag_lingbot_pose_accuracy.py's goal-insertion test,
+        comparing against a true continuous-stream oracle and the goal's real GT position)
+        ``warm=64`` closes this gap almost entirely — matches oracle to within noise, while
+        ``warm=32`` (the nominal window) leaves ~30% avoidable error on the table and
+        ``warm=128`` buys nothing further. Cost is fixed at `warm` frames regardless of how
+        deep `m` is, unlike replaying the whole trajectory.
+        """
+        start = max(self.num_scale, m - warm + 1)
+        n_hist = start - self.num_scale
+        self._inject(cache["scale_k"], cache["scale_v"], cache["anchor_k"], cache["anchor_v"],
+                    n_hist=n_hist, total_frames=start)
+        imgs = self.load_images([os.path.join(rgb_dir, f"{i}.jpg") for i in range(start, m + 1)])
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            for j in range(len(imgs)):
+                self.model._aggregate_features(
+                    imgs[j:j + 1][None].to(self.device),
+                    num_frame_for_scale=self.num_scale, num_frame_per_block=1,
+                )
+        return self._stream_one(goal_img, return_agg=return_agg)   # goal at time m+1
+
     # ------------------------------------------------------------------ #
     # context-free DINOv2 (retrieval / matching space)
     # ------------------------------------------------------------------ #

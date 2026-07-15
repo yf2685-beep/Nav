@@ -75,6 +75,14 @@ memnav_exp_cfg = ExpCfg(
         window_size=_WINDOW_SIZE,
         num_scale=_NUM_SCALE,
         max_frame_num=_MAX_FRAME_NUM,
+        # goal_append_warm's live-recompute depth before streaming the goal (deeper than
+        # window_size on purpose): window_size's cold start at the window boundary starves
+        # the goal's pose estimate (no real predecessors); goal_warm=64 empirically matches
+        # a true continuous-stream oracle (scripts/diag_lingbot_pose_accuracy.py), while the
+        # nominal window leaves ~30% avoidable error on the table. Eviction stays at
+        # window_size — the model's own KV eviction trims back to that during the warm
+        # recompute, which measured the same accuracy as never evicting at all.
+        goal_warm=64,
         # policy / diffusion
         predict_size=24,
         temporal_depth=8,

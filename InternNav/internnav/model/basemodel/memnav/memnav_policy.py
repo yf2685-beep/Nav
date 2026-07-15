@@ -112,38 +112,109 @@ class NovelBranch(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# (2.merge) Revisit: merge current pose token + goal pose token — trainable
+# (2.merge) Revisit: analytic relative pose -> decoder tokens + calibrated (x,y)
 # --------------------------------------------------------------------------- #
 class RevisitMerge(nn.Module):
-    """LoGoPlanner `state_decoder` analog: fuse the **current** and **goal** absolute
-    camera poses (from the frozen camera head, map frame) and *learn the relative pose*.
-    A LingBot-style pose encoder (`embed_pose` = Linear(7→dim) on [T, unit-quat]) embeds each, a shared
-    TokenCompressor fuses them, then two own heads:
-      - revisit_head  → revisit_readout (the diffusion goal slot)
-      - aux_pose_head → (x, y, θ)        (GT-supervised relative pose, like pg_pred_mlp)
+    """Turns the **current** and **goal** absolute camera poses (frozen camera head, map
+    frame) into the goal's relative pose, analytically — NOT via independently-embedded
+    absolute-pose tokens merged by attention. T_cur^-1 T_goal is BILINEAR in the two
+    absolute poses (t_rel = R_cur^T(t_goal - t_cur) is a product of a rotation derived
+    from cur_pose and a translation difference derived from both); a linear embed of each
+    pose + attention-merge can only produce affine combinations of the two, and can never
+    synthesize that cross term. So it's computed here in closed form (`_relative_pose`),
+    same reasoning as VGGT/Pi3 supervising relative pose directly.
+
+      - revisit_head  → revisit_readout (the diffusion goal slot). TRAINABLE: a plain
+        Linear on [t_rel, R_rel.flatten()] (12-d) — no attention needed for a single
+        input feature vector (TokenCompressor would degenerate to per-slot linear reads
+        of it anyway).
+      - aux_pose_head → (x, y) ONLY, not θ. θ (net heading change along the path from
+        departure to arrival) is NOT a function of the two endpoint poses — it depends on
+        the geodesic route's shape between them (obstacle layout), which two poses don't
+        encode; that's the diffusion decoder's job (it sees current_state's depth/visual
+        context), not RevisitMerge's. And the goal image's own rendered orientation is
+        independent of the real arrival heading by construction of the data generator
+        (MemNavData/generate_twoleg.py: "NO terminal orientation alignment... arrival
+        heading is the natural approach heading"; goal_yaw = anchor's OWN heading +
+        random jitter) — so there is no θ signal in (cur_pose, goal_pose) to extract even
+        in principle.
+        aux_pose_head is a FROZEN (non-trainable) Linear(3,2): cur_pose/goal_pose come
+        from the frozen camera head under no_grad, so t_rel carries no gradient anyway —
+        a learned correction here can only ever converge to the same fixed calibration a
+        precomputed one would, since t_rel alone carries no per-sample signal a global
+        affine map could improve on (LingBot's scale ambiguity/axis convention is a
+        global property, not something (cur_pose,goal_pose) alone lets you condition
+        per-sample). Kept as a logged diagnostic (not part of the optimized loss — see
+        MemNavTrainer), not deleted, so that IF the frozen branch is later LoRA-tuned
+        (making cur_pose/goal_pose differentiable), unfreezing this one module turns it
+        back into a real trainable calibration head with zero other code changes.
+        Weights are set to the empirically-fit R_conv + scale (see
+        scripts/diag_lingbot_pose_accuracy.py's end-to-end validation: real t_rel vs
+        real GT goal position, ~3° direction error, ~0.52-0.56 magnitude ratio across
+        two independent episodes — consistent with the ~0.5x scale-ambiguity finding in
+        the lingbot-pose-calibration investigation).
     """
 
-    def __init__(self, dim=384, heads=8, n_out=4):
+    # Empirically-fit local-frame axis convention (LingBot pose9 -> dataset's local
+    # (x,y,z)): swap x/y with sign flips, negate z. Validated two ways — (1) fitting a
+    # rotation between consecutive-frame LOCAL displacement directions (LingBot vs GT),
+    # clean (~3-5 deg residual) whenever LingBot's own pose estimate is accurate, and
+    # degrading in lockstep with measured LingBot VO drift (not a different convention
+    # per trajectory); (2) applying it to REAL t_rel from REAL (cur_pose, goal_pose)
+    # pairs and comparing directly to real GT goal_rel_pose (x,y): ~3 deg direction
+    # error. Scale: mean(0.523, 0.559) magnitude ratio across those two episodes -> the
+    # correction is 1/0.541.
+    _R_CONV = ((0.0, -1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, -1.0))
+    _SCALE = 1.0 / 0.541
+
+    def __init__(self, dim=384, n_out=4):
         super().__init__()
-        # --- shared: pose encoder (LingBot embed_pose design) + fusion ---
-        self.pose_encoder = nn.Linear(7, dim)               # [T(3), unit-quat(4)] -> dim
-        self.merge = TokenCompressor(dim, heads, n_out)
-        # --- own heads ---
-        self.revisit_head = nn.Linear(dim, dim)
-        self.aux_pose_head = nn.Sequential(nn.Linear(dim, dim // 2), nn.ReLU(), nn.Linear(dim // 2, 3))
+        self.revisit_head = nn.Linear(12, n_out * dim)       # [t_rel(3), R_rel.flatten(9)] -> n_out tokens
+        self.n_out, self.dim = n_out, dim
+        # frozen, pre-calibrated (x,y) readout — see class docstring
+        self.aux_pose_head = nn.Linear(3, 2)
+        R_conv = torch.tensor(self._R_CONV)
+        with torch.no_grad():
+            self.aux_pose_head.weight.copy_(self._SCALE * R_conv[:2])
+            self.aux_pose_head.bias.zero_()
+        self.aux_pose_head.requires_grad_(False)
 
     @staticmethod
-    def _pose7(pose9):
-        """9-d (absT[3], quaR[4], FoV[2]) -> 7-d [T, unit-quat]: drop FoV (constant intrinsic),
-        normalize the quaternion (head emits raw non-unit quat; magnitude is decoded away)."""
-        return torch.cat([pose9[..., :3], F.normalize(pose9[..., 3:7], dim=-1)], dim=-1)
+    def _split_pose9(pose9):
+        """9-d (absT[3], quaR[4] xyzw cam->world, FoV[2]) -> (t [...,3], unit-quat [...,4]).
+        Drops FoV (constant intrinsic); normalizes the quaternion (head emits raw
+        non-unit quat; magnitude is decoded away)."""
+        return pose9[..., :3], F.normalize(pose9[..., 3:7], dim=-1)
+
+    @staticmethod
+    def _relative_pose(cur_pose9, goal_pose9):
+        """Analytic T_cur^-1 @ T_goal, split (not recombined into a quaternion — nothing
+        downstream needs the compact 4-d form, and mat_to_quat's branch-selection has
+        known numerical rough edges near 180-deg rotations that a plain flattened
+        rotation matrix avoids).
+        quaR is cam->world (p_world = R @ p_cam), so T_cur^-1 expresses goal in cur's own
+        local frame: t_rel = R_cur^T(t_goal - t_cur), R_rel = R_cur^T R_goal — the
+        bilinear cross term a linear head can't reconstruct from (cur_pose, goal_pose)
+        embedded independently. Lazy import: needs lingbot_repo on sys.path, which
+        LingBotStream.__init__ guarantees has already run by the time this is called.
+        """
+        from lingbot_map.utils.rotation import quat_to_mat
+        t_cur, q_cur = RevisitMerge._split_pose9(cur_pose9)
+        t_goal, q_goal = RevisitMerge._split_pose9(goal_pose9)
+        R_cur = quat_to_mat(q_cur)                                    # [B,3,3]
+        R_goal = quat_to_mat(q_goal)                                  # [B,3,3]
+        R_cur_T = R_cur.transpose(-1, -2)
+        t_rel = (R_cur_T @ (t_goal - t_cur).unsqueeze(-1)).squeeze(-1)   # R_cur^T (t_goal - t_cur)
+        R_rel = R_cur_T @ R_goal                                         # R_cur^T R_goal
+        return t_rel, R_rel
 
     def forward(self, cur_pose, goal_pose):
         """cur_pose, goal_pose: [B, 9] absolute camera poses (map frame)."""
-        toks = torch.stack([self.pose_encoder(self._pose7(cur_pose)),
-                            self.pose_encoder(self._pose7(goal_pose))], dim=1)  # [B,2,dim]
-        shared = self.merge(toks)                                        # [B, n_out, dim]  (shared)
-        return self.revisit_head(shared), self.aux_pose_head(shared.mean(1))   # [B,n_out,dim], [B,3]
+        t_rel, R_rel = self._relative_pose(cur_pose, goal_pose)          # [B,3], [B,3,3]
+        aux_pose = self.aux_pose_head(t_rel)                             # [B,2]  (x,y) only — frozen
+        rel_feat = torch.cat([t_rel, R_rel.flatten(-2)], dim=-1)         # [B,12]
+        revisit_readout = self.revisit_head(rel_feat).view(-1, self.n_out, self.dim)
+        return revisit_readout, aux_pose
 
 
 # --------------------------------------------------------------------------- #
@@ -152,7 +223,7 @@ class RevisitMerge(nn.Module):
 class MemNavNet(nn.Module):
     def __init__(self, lingbot_kwargs=None, dino_dim=1024, lingbot_dim=2048, depth_feat_dim=256,
                  token_dim=384, heads=8, m_rgbd=4, m_depth=4, m_revisit=4, m_novel=4,
-                 predict_size=24, temporal_depth=8, num_diffusion_iters=10, device="cuda"):
+                 predict_size=24, temporal_depth=8, num_diffusion_iters=10, goal_warm=64, device="cuda"):
         super().__init__()
         self.lingbot = LingBotStream(device=device, **(lingbot_kwargs or {}))
         self.window = self.lingbot.window
@@ -160,6 +231,10 @@ class MemNavNet(nn.Module):
         self.device = device
         self.heads = heads
         self.predict_size = predict_size
+        # goal_append_warm's live-recompute depth before streaming the goal — deeper than
+        # `window` on purpose (see LingBotStream.goal_append_warm); validated against a
+        # continuous-stream oracle in scripts/diag_lingbot_pose_accuracy.py.
+        self.goal_warm = goal_warm
 
         # trainable heads
         self.retrieval = RetrievalHead(dino_dim=dino_dim)
@@ -172,8 +247,8 @@ class MemNavNet(nn.Module):
         self.proj_depth = nn.Linear(depth_feat_dim, token_dim)
         self.compress_rgbd = TokenCompressor(token_dim, heads, m_rgbd)
         self.compress_depth = TokenCompressor(token_dim, heads, m_depth)
-        # revisit: encode current + goal absolute camera poses, learn the relative (+ aux pose head)
-        self.revisit_merge = RevisitMerge(token_dim, heads, m_revisit)
+        # revisit: analytic relative pose from current + goal absolute camera poses (+ aux pose head)
+        self.revisit_merge = RevisitMerge(token_dim, m_revisit)
 
         # --- NavDP DDPM decoder (no critic) ---
         # memory layout: [ time(1) | current_state(n_cs) | revisit(n_rev) | novel(n_nov) ]
@@ -212,8 +287,8 @@ class MemNavNet(nn.Module):
         return torch.cat([rgbd, geom], dim=1)
 
     def build_revisit(self, cur_pose, goal_pose):
-        """cur_pose/goal_pose [B, 2C] camera-head pose features (current frame + goal_append)
-        -> (revisit_readout [B,m_revisit,token_dim], aux_pose [B,3])."""
+        """cur_pose/goal_pose [B, 9] absolute camera poses (current frame + goal_append_warm)
+        -> (revisit_readout [B,m_revisit,token_dim], aux_pose [B,2] (x,y) only)."""
         return self.revisit_merge(cur_pose, goal_pose)
 
     # ----- DDPM decoder ------------------------------------------------ #
@@ -338,7 +413,7 @@ class MemNavNet(nn.Module):
             anchor = match_idx
 
         B = len(batch["cache_paths"])
-        W, lo = self.window, self.num_scale + self.window - 1
+        lo = self.num_scale + self.window - 1
         cur_t, dfeat_t, curp, goalp = [], [], [], []
         for b in range(B):
             k = int(batch["cur_steps"][b])
@@ -356,11 +431,14 @@ class MemNavNet(nn.Module):
                 # cur_pose: read the precomputed continuous-stream pose directly (exact,
                 # no cold-start reconstruction) — k is always a real trajectory frame.
                 cur_pose = cache["cam_pose_enc"][k]                                  # [9] current abs pose
-                # (2) revisit: goal_append at the anchor frame (clamped valid) -> goal abs pose
+                # (2) revisit: goal_append_warm at the anchor frame (clamped valid) -> goal abs pose.
+                # Deep warm-recompute (self.goal_warm, not the nominal window W) before streaming
+                # the goal — window_forward's cold start at the W boundary starves the goal's pose
+                # estimate; goal_warm=64 empirically matches a true continuous-stream oracle (see
+                # LingBotStream.goal_append_warm / scripts/diag_lingbot_pose_accuracy.py).
                 m = int(anchor[b].clamp(lo, k - 1).item())
-                mw = self.lingbot.load_images([os.path.join(rgb_dir, f"{i}.jpg")
-                                               for i in range(m - W + 1, m + 1)]).to(dev)
-                _, goal_agg = self.lingbot.goal_append(goal_img, cache, m, mw, return_agg=True)
+                _, goal_agg = self.lingbot.goal_append_warm(goal_img, cache, m, rgb_dir,
+                                                            self.goal_warm, return_agg=True)
                 goal_pose = self.lingbot.camera_pose(ck, cv, m + 1, goal_agg)[-1]   # [9] goal abs pose
                 # (3) novel branch runs on raw images (batched, in forward) — no live dino needed
             cur_t.append(cur); dfeat_t.append(dfeat); curp.append(cur_pose); goalp.append(goal_pose)
@@ -425,6 +503,7 @@ class MemNavPolicy(PreTrainedModel):
         self.core = MemNavNet(
             token_dim=il['token_dim'], heads=il['heads'], predict_size=il['predict_size'],
             temporal_depth=il['temporal_depth'], num_diffusion_iters=il.get('num_diffusion_iters', 10),
+            goal_warm=il.get('goal_warm', 64),
             lingbot_kwargs=lingbot_kwargs or None, device=str(self._device),
         )
 
