@@ -151,7 +151,7 @@ def main():
     net.train()
     # exact trainer loss
     noise = fwd["noise"]
-    action_loss = 0.5 * (fwd["noise_ng"] - noise).square().mean() + 0.5 * (fwd["noise_mg"] - noise).square().mean()
+    action_loss = (fwd["noise_pred"] - noise).square().mean()
     rl = fwd["ret_logits"]; gl = fwd["gate_logit"]
     pos = batch["batch_pos_mask"].to(dev).bool(); neg = batch["batch_neg_mask"].to(dev).bool()
     is_rev = batch["batch_is_revisit"].to(dev)

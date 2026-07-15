@@ -77,6 +77,24 @@ import torch
 
 from internnav.dataset.navdp_dataset_lerobot import NavDP_Base_Datset
 
+# Habitat (Y-up) -> dataset "data" world frame (Z-up): data = MW @ habitat. Exact transform
+# used when the parquet/gen_meta.json were written (MemNavData/generate_twoleg.py:save_traj:
+# `Td[:3,:3] = M_W @ Tw[:3,:3]`) — a plain left-multiply (not a conjugation) because MW changes
+# the WORLD basis while the camera/local frame is untouched.
+_MW_HAB2DATA = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+
+
+def _yaw_habitat_to_R_data(yaw):
+    """gen_meta.json's per-goal `yaw_habitat` -> rotation matrix in the dataset's data
+    frame. `yaw_habitat` is explicitly the RAW habitat-frame yaw ("in render frame" per
+    gen_meta's frame_convention note, unlike positions which are already data-frame) — it's
+    cam_to_world_hab's own construction (generate_twoleg.py): a pure rotation about
+    habitat's Y (up) axis, R_y(yaw) = [[cos,0,sin],[0,1,0],[-sin,0,cos]], no pitch/roll
+    (camera always level). Converted to data frame via the same MW used for positions."""
+    c, s = np.cos(yaw), np.sin(yaw)
+    R_hab = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+    return _MW_HAB2DATA @ R_hab
+
 
 class MemNav_Dataset(NavDP_Base_Datset):
     def __init__(
@@ -289,9 +307,14 @@ class MemNav_Dataset(NavDP_Base_Datset):
             goal_img_path = os.path.join(traj_dir, f'goal_{j + 1}.jpg')
             if not (os.path.isfile(goal_img_path) and os.path.isfile(_rgb(k_lo))):
                 continue
+            # yaw_habitat: the goal RENDER's own orientation (raw habitat frame — see
+            # _yaw_habitat_to_R_data) — used for the rotation-accuracy diagnostic
+            # (goal_rel_rotation), NOT the action label (that's path-tangent, unrelated
+            # to the render's orientation by construction — see RevisitMerge docstring).
             out.append(dict(has_covis=True, goal_j=j, leg_start=leg_start, goal_step=goal_step,
                             k_lo=int(k_lo), k_hi=int(k_hi), goal_img_path=goal_img_path,
-                            curve=curve, pos_hi=pos_hi, pos_lo=pos_lo, amargin=amargin))
+                            curve=curve, pos_hi=pos_hi, pos_lo=pos_lo, amargin=amargin,
+                            yaw_habitat=float(g.get('yaw_habitat', 0.0))))
 
         # --- goal A (first milestone): no earlier pass, so ALWAYS novel under the unified
         #     rule (its only co-observers are recent approach frames -> excluded by E(k)).
@@ -415,6 +438,16 @@ class MemNav_Dataset(NavDP_Base_Datset):
         seg = extrinsics[k : goal_step + 1].copy()         # seg[0] == current frame k
         pred_actions, goal_rel_pose = self._build_actions(seg, base_extrinsic, pred_digit)
 
+        # --- GT relative ROTATION current->goal, for the rotation-accuracy diagnostic
+        # only (NOT the action label — goal_rel_pose's θ is path-tangent, unrelated to
+        # either pose's own orientation, see RevisitMerge docstring). Covis goals: the
+        # render's own yaw_habitat. Goal A: its "goal image" IS a real trajectory frame,
+        # so its rotation is just that frame's own — no yaw_habitat needed.
+        R_cur_gt = extrinsics[k, :3, :3]
+        R_goal_gt = (_yaw_habitat_to_R_data(s['yaw_habitat']) if s['has_covis']
+                    else extrinsics[goal_step, :3, :3])
+        goal_rel_rotation = R_cur_gt.T @ R_goal_gt          # [3,3]
+
         # --- raw images (LingBot-preprocessed): always needed every sample ---
         rgb_dir = self.trajectory_rgb_dir[ti]
         window_idx = list(range(k - self.window_size + 1, k + 1))  # [k-W+1 .. k]
@@ -432,6 +465,7 @@ class MemNav_Dataset(NavDP_Base_Datset):
             'is_revisit': torch.tensor(float(not null_pos), dtype=torch.float32),
             'pred_actions': torch.tensor(pred_actions, dtype=torch.float32),
             'goal_rel_pose': torch.tensor(goal_rel_pose, dtype=torch.float32),   # aux pose GT
+            'goal_rel_rotation': torch.tensor(goal_rel_rotation, dtype=torch.float32),  # [3,3] rotation diagnostic GT
             # raw images for the on-the-fly dense DINO + GCT window-forward.
             #   goal_cls is NOT cached for real goal images — the policy computes it
             #   from goal_image via the frozen context-free DINO trunk.
@@ -481,6 +515,7 @@ def memnav_collate_fn(batch):
         'batch_is_revisit':      torch.stack([b['is_revisit'] for b in batch]),        # [B] float
         'batch_labels':          torch.stack([b['pred_actions'] for b in batch]),
         'batch_goal_rel_pose':   torch.stack([b['goal_rel_pose'] for b in batch]),     # aux pose GT
+        'batch_goal_rel_rotation': torch.stack([b['goal_rel_rotation'] for b in batch]),  # [B,3,3] rotation diagnostic GT
         # raw images (goal_cls is computed from batch_goal_image in the policy)
         'batch_goal_image':      torch.stack([b['goal_image'] for b in batch]),        # [B, 3, H, W]
         'batch_window_images':   torch.stack([b['window_images'] for b in batch]),     # [B, W, 3, H, W]

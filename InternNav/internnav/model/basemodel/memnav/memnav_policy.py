@@ -6,6 +6,11 @@ Three goal pathways (see GL.md / memnav-project memory):
   (3) novel current→goal (DINO)   — TRAINABLE cross-attention, unseen goals
 Retrieval confidence biases the decoder cross-attention toward (2) vs (3) (no multiply,
 no goal_cls). NavDP DDPM decoder on top; NO critic (collision is geometric at eval).
+Always goal-conditioned — no classifier-free "no-goal" branch (dropped: our goal-directed
+two-leg episodes can require a genuine U-turn, so masking the goal out of the label gave
+the unconditional branch contradictory supervision — same visual context, opposite action,
+depending on whether that episode happened to reverse — worst exactly at the turn where a
+CFG contrast would matter most; CFG guidance scale was never benchmarked for this model).
 """
 
 import os
@@ -214,7 +219,11 @@ class RevisitMerge(nn.Module):
         aux_pose = self.aux_pose_head(t_rel)                             # [B,2]  (x,y) only — frozen
         rel_feat = torch.cat([t_rel, R_rel.flatten(-2)], dim=-1)         # [B,12]
         revisit_readout = self.revisit_head(rel_feat).view(-1, self.n_out, self.dim)
-        return revisit_readout, aux_pose
+        # R_rel returned too — not for any loss (no head/calibration needed for it, it's a
+        # raw feature into revisit_head), just so the trainer can log a rotation-accuracy
+        # diagnostic against GT (batch_goal_rel_rotation), same treatment as the gate/match
+        # diagnostics already logged under no_grad in MemNavTrainer.compute_loss.
+        return revisit_readout, aux_pose, R_rel
 
 
 # --------------------------------------------------------------------------- #
@@ -288,7 +297,7 @@ class MemNavNet(nn.Module):
 
     def build_revisit(self, cur_pose, goal_pose):
         """cur_pose/goal_pose [B, 9] absolute camera poses (current frame + goal_append_warm)
-        -> (revisit_readout [B,m_revisit,token_dim], aux_pose [B,2] (x,y) only)."""
+        -> (revisit_readout [B,m_revisit,token_dim], aux_pose [B,2] (x,y) only, R_rel [B,3,3])."""
         return self.revisit_merge(cur_pose, goal_pose)
 
     # ----- DDPM decoder ------------------------------------------------ #
@@ -299,37 +308,33 @@ class MemNavNet(nn.Module):
         mem = torch.cat([time_emb, current_state, revisit, novel], dim=1)
         return mem + self.cond_pos_embed(mem)
 
-    def _gate_mask(self, gate, mode):
+    def _gate_mask(self, gate):
         """Per-sample cross-attention bias [B*heads, predict_size, mem_len] — directs
         attention without scaling the readouts.
-          mg: revisit cols += log(gate), novel cols += log(1-gate)
-          ng: revisit+novel cols = -inf  (classifier-free no-goal)"""
+          revisit cols += log(gate), novel cols += log(1-gate)"""
         B = gate.shape[0]
         bias = gate.new_zeros(B, self.mem_len)
         rs, re = 1 + self.n_cs, 1 + self.n_cs + self.n_rev
         ns, ne = re, re + self.n_nov
-        if mode == "mg":
-            g = gate.clamp(1e-4, 1 - 1e-4)
-            bias[:, rs:re] = torch.log(g).unsqueeze(1) + self.branch_bias[0]      # revisit
-            bias[:, ns:ne] = torch.log(1 - g).unsqueeze(1) + self.branch_bias[1]  # novel
-        else:                                          # ng
-            bias[:, rs:ne] = float("-inf")
+        g = gate.clamp(1e-4, 1 - 1e-4)
+        bias[:, rs:re] = torch.log(g).unsqueeze(1) + self.branch_bias[0]      # revisit
+        bias[:, ns:ne] = torch.log(1 - g).unsqueeze(1) + self.branch_bias[1]  # novel
         bias = bias[:, None, None, :].expand(B, self.heads, self.predict_size, self.mem_len)
         return bias.reshape(B * self.heads, self.predict_size, self.mem_len)
 
-    def predict_noise(self, noisy, timestep, current_state, revisit, novel, gate, mode):
+    def predict_noise(self, noisy, timestep, current_state, revisit, novel, gate):
         a = self.input_embed(noisy)
         a = a + self.out_pos_embed(a)
         mem = self._memory(current_state, revisit, novel, timestep)
         out = self.decoder(tgt=a, memory=mem, tgt_mask=self.tgt_mask,
-                           memory_mask=self._gate_mask(gate, mode))
+                           memory_mask=self._gate_mask(gate))
         return self.action_head(self.layernorm(out))
 
     def forward(self, batch):
         dev = self.device
         enc = self.encode_memory(batch)
         current_state = self.build_current_state(enc["current"], enc["depth_feat"])
-        revisit, aux_pose = self.build_revisit(enc["cur_pose"], enc["goal_pose"])
+        revisit, aux_pose, R_rel = self.build_revisit(enc["cur_pose"], enc["goal_pose"])
         novel = self.novel(batch["batch_window_images"][:, -1].to(dev),   # current frame [B,3,H,W]
                            batch["batch_goal_image"].to(dev))             # goal frame
         gate = enc["revisit_gate"]
@@ -340,11 +345,10 @@ class MemNavNet(nn.Module):
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=dev)
         noisy = self.noise_scheduler.add_noise(labels, noise, timesteps)
 
-        noise_mg = self.predict_noise(noisy, timesteps, current_state, revisit, novel, gate, "mg")
-        noise_ng = self.predict_noise(noisy, timesteps, current_state, revisit, novel, gate, "ng")
+        noise_pred = self.predict_noise(noisy, timesteps, current_state, revisit, novel, gate)
         return dict(
-            noise_ng=noise_ng, noise_mg=noise_mg, noise=noise,
-            aux_pose=aux_pose, ret_logits=enc["ret_logits"], revisit_gate=gate,
+            noise_pred=noise_pred, noise=noise,
+            aux_pose=aux_pose, R_rel=R_rel, ret_logits=enc["ret_logits"], revisit_gate=gate,
             gate_logit=enc["gate_logit"], match_idx=enc["match_idx"], anchor_idx=enc["anchor_idx"],
         )
 
@@ -560,7 +564,7 @@ if __name__ == "__main__":
         print(f"  cur_steps={batch['cur_steps']} goal_steps={batch['goal_steps']} match_idx={out['match_idx'].tolist()}")
         cs = net.build_current_state(out["current"], out["depth_feat"])
         nov = net.novel(batch["batch_window_images"][:, -1].to(net.device), batch["batch_goal_image"].to(net.device))
-        rr, ap = net.build_revisit(out["cur_pose"], out["goal_pose"])
+        rr, ap, _R_rel = net.build_revisit(out["cur_pose"], out["goal_pose"])
         print(f"  current_state (RGBD+depth Perceiver): {tuple(cs.shape)} req_grad={cs.requires_grad}")
         print(f"  novel readout: {tuple(nov.shape)} req_grad={nov.requires_grad}")
         print(f"  revisit_readout: {tuple(rr.shape)} | aux_pose: {tuple(ap.shape)} req_grad={rr.requires_grad}")
@@ -569,8 +573,7 @@ if __name__ == "__main__":
         print("\nforward outputs:")
         for key, v in fwd.items():
             print(f"  {key}: {tuple(v.shape)} {v.dtype}")
-        loss = ((fwd["noise_mg"] - fwd["noise"]).square().mean()
-                + (fwd["noise_ng"] - fwd["noise"]).square().mean()
+        loss = ((fwd["noise_pred"] - fwd["noise"]).square().mean()
                 + fwd["aux_pose"].square().mean())
         loss.backward()
         n_grad = sum(1 for p in net.parameters() if p.requires_grad and p.grad is not None)

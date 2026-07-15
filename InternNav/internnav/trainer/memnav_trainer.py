@@ -11,7 +11,9 @@ from internnav.trainer.base import BaseTrainer
 
 class MemNavTrainer(BaseTrainer):
     """memnav: frozen LingBot front-end + trainable retrieval / novel / current_state /
-    revisit / DDPM decoder. Loss = 0.5·ng + 0.5·mg (ε-MSE) + retrieval-CE + aux-pose.
+    revisit / DDPM decoder. Loss = action (ε-MSE, always goal-conditioned) + retrieval-CE
+    + aux-pose. No classifier-free no-goal branch (see memnav_policy.py docstring — dropped,
+    never benchmarked, and label-ambiguous for our U-turn-containing episodes).
     No critic — collision is checked geometrically from the point map at eval."""
 
     def __init__(self, config, **kwargs):
@@ -21,6 +23,17 @@ class MemNavTrainer(BaseTrainer):
         self.w_gate = getattr(config.il, "w_gate", 1.0)          # revisit/novel BCE
         self.w_aux = getattr(config.il, "w_aux_pose", 0.5)
         self.model_device = (self.model.module if hasattr(self.model, "module") else self.model).device
+        # Rotation-specific local-frame correction for the rotation-accuracy diagnostic
+        # (compute_loss, R_rel vs batch_goal_rel_rotation). NOT RevisitMerge.aux_pose_head's
+        # _R_CONV/_SCALE — empirically, translation and rotation need DIFFERENT corrections;
+        # reusing translation's R_conv via conjugation (R_conv @ R_rel @ R_conv^T) was tried
+        # first and gave ~180° error even on a case with ~3° translation error, i.e. it was
+        # putting the rotation in the wrong plane entirely, not just the wrong angle. Fit
+        # separately (Kabsch on rotation-AXIS pairs extracted from real (R_rel, GT) samples,
+        # not reused from the translation fit): a clean 180° rotation about Z (fitted matrix
+        # was within 0.7° of this exact diag), median residual ~1-5° depending on trajectory
+        # difficulty (same VO-accuracy dependence as everything else in this pipeline).
+        self._C_rot = torch.tensor([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]])
         print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] Model device: {self.model_device}")
 
     # ------------------------------------------------------------------ #
@@ -28,11 +41,9 @@ class MemNavTrainer(BaseTrainer):
         dev = next(model.parameters()).device
         fwd = model(inputs)                                       # forward(batch) moves tensors internally
 
-        # --- diffusion action loss (classifier-free ng + mg) ---
+        # --- diffusion action loss (always goal-conditioned) ---
         noise = fwd["noise"]
-        ng_loss = (fwd["noise_ng"] - noise).square().mean()
-        mg_loss = (fwd["noise_mg"] - noise).square().mean()
-        action_loss = 0.5 * ng_loss + 0.5 * mg_loss
+        action_loss = (fwd["noise_pred"] - noise).square().mean()
 
         # --- retrieval: DECOUPLED ranking (InfoNCE) + revisit gate (BCE) ---
         # A joint softmax with a null slot collapses to always-null (the easy shortcut),
@@ -66,6 +77,7 @@ class MemNavTrainer(BaseTrainer):
         revisit = is_rev                                         # 1 = goal is in memory
         per = (fwd["aux_pose"] - gt_pose).square().mean(-1)      # [B]
         aux_loss = (per * revisit).sum() / revisit.sum().clamp(min=1.0)
+        R_rel = fwd["R_rel"]                                      # [B,3,3] predicted relative rotation
 
         loss = (action_loss + self.w_retr * rank_loss
                 + self.w_gate * gate_loss + self.w_aux * aux_loss)
@@ -81,23 +93,52 @@ class MemNavTrainer(BaseTrainer):
             pred = ret_logits.argmax(-1)                          # [B] best candidate frame
             hit = pos.gather(1, pred[:, None]).squeeze(1).float()
             seen_match = (hit * revisit).sum() / ns               # retrieved the true frame (revisit)
-        outputs = dict(loss=loss, action_loss=action_loss, ng_loss=ng_loss, mg_loss=mg_loss,
+
+            # --- position diagnostics, plain-units companions to aux_loss (MSE): pos_err_m is
+            # the actual metric distance (not squared) between the calibrated aux_pose and GT
+            # (x,y); pos_dir_err_deg is the BEARING error only (angle between the predicted and
+            # GT relative-position vectors, scale-invariant) — separates "direction is right but
+            # scale/magnitude is off" from "direction itself is wrong". Neither is comparable to
+            # rot_err_deg below: these are about WHERE the goal is, rot_err_deg is about the
+            # camera's relative ORIENTATION — a sample can have one right and the other wrong. ---
+            pos_err = torch.linalg.norm(fwd["aux_pose"] - gt_pose, dim=-1)          # [B] meters
+            pos_dir_cos = ((fwd["aux_pose"] * gt_pose).sum(-1)
+                          / (torch.linalg.norm(fwd["aux_pose"], dim=-1)
+                             * torch.linalg.norm(gt_pose, dim=-1) + 1e-9)).clamp(-1, 1)
+            pos_dir_err_deg = torch.rad2deg(torch.arccos(pos_dir_cos))              # [B]
+            pos_err_m = (pos_err * revisit).sum() / ns
+            pos_dir_err = (pos_dir_err_deg * revisit).sum() / ns
+
+            # --- rotation-accuracy diagnostic (pure logging, no loss/gradient — R_rel comes
+            # from the frozen camera head under no_grad same as t_rel; see RevisitMerge). Not
+            # comparable to GT theta (path-tangent, unrelated) — this compares the actual
+            # relative CAMERA rotation against real GT extrinsics/render orientation
+            # (batch_goal_rel_rotation). Conjugate, not left-multiply, to change basis for a
+            # rotation matrix rather than a translation vector. ---
+            C_rot = self._C_rot.to(dev, R_rel.dtype)
+            R_rel_conv = C_rot @ R_rel @ C_rot.transpose(-1, -2)      # [B,3,3]
+            gt_rot = inputs["batch_goal_rel_rotation"].to(dev)          # [B,3,3]
+            cos_ang = (((R_rel_conv * gt_rot).sum(dim=(-2, -1)) - 1) / 2).clamp(-1, 1)
+            rot_err_deg = torch.rad2deg(torch.arccos(cos_ang))          # [B]
+            rot_err = (rot_err_deg * revisit).sum() / ns                # masked mean, revisit rows only
+        outputs = dict(loss=loss, action_loss=action_loss,
                        retrieval_loss=rank_loss, gate_loss=gate_loss, aux_loss=aux_loss,
                        gate_seen=gate_seen, gate_unseen=gate_unseen, gate_sep=gate_sep,
-                       gate_acc=gate_acc, seen_match_acc=seen_match)
+                       gate_acc=gate_acc, seen_match_acc=seen_match, rot_err_deg=rot_err,
+                       pos_err_m=pos_err_m, pos_dir_err_deg=pos_dir_err)
         if (dist.get_rank() if dist.is_initialized() else 0) == 0:
             print(f"[Step {self.state.global_step}] loss={loss.item():.4f} act={action_loss.item():.4f} "
                   f"rank={rank_loss.item():.4f} gate={gate_loss.item():.4f} aux={aux_loss.item():.4f} | "
                   f"gate seen={gate_seen.item():.2f} unseen={gate_unseen.item():.2f} sep={gate_sep.item():+.2f} "
-                  f"acc={gate_acc.item():.2f} | match seen={seen_match.item():.2f}")
+                  f"acc={gate_acc.item():.2f} | match seen={seen_match.item():.2f} | "
+                  f"pos_err={pos_err_m.item():.2f}m dir_err={pos_dir_err.item():.1f}deg "
+                  f"rot_err={rot_err.item():.1f}deg")
 
         # Per-component metrics → wandb/tb. self.log is rank-0-only inside HF Trainer;
         # gate by logging_steps to match train/loss cadence and avoid extra .item() syncs.
         if self.state.global_step % self.args.logging_steps == 0:
             log_payload = {
                 'train/action_loss': action_loss.item(),
-                'train/ng_loss': ng_loss.item(),
-                'train/mg_loss': mg_loss.item(),
                 'train/retrieval_loss': rank_loss.item(),
                 'train/gate_loss': gate_loss.item(),
                 'train/aux_loss': aux_loss.item(),
@@ -106,6 +147,9 @@ class MemNavTrainer(BaseTrainer):
                 'train/gate_unseen': gate_unseen.item(),
                 'train/gate_sep': gate_sep.item(),
                 'train/seen_match_acc': seen_match.item(),
+                'train/rot_err_deg': rot_err.item(),
+                'train/pos_err_m': pos_err_m.item(),
+                'train/pos_dir_err_deg': pos_dir_err.item(),
             }
             if dev.type == 'cuda':
                 # Peak since previous logging_step, in GiB. Reset right after so the
