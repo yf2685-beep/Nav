@@ -11,6 +11,7 @@
 #SBATCH --partition=a100_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --export=ALL
+# REQUIRED: complete scripts/train_memnav/README.md before every sbatch submission.
 #
 # MemNav single-GPU training / smoke on the InternData-N1 MP3D shard.
 # Mirrors the `sbatch_lg` pattern in GR00T_cam: standalone .sbatch with

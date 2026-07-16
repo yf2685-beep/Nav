@@ -11,6 +11,7 @@
 #SBATCH --partition=h100_tandon,h200_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --export=ALL
+# REQUIRED: complete scripts/train_memnav/README.md before every sbatch submission.
 #
 # Precompute frozen LingBot-Map KV caches for the PACKED mp3d 0-53 scenes.
 # Frames live in a read-only squashfs (pt1.sqf). We mount it the NYU-supported way:
