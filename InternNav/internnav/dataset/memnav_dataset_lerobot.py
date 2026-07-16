@@ -479,6 +479,11 @@ class MemNav_Dataset(NavDP_Base_Datset):
             'rgb_dir': rgb_dir,
             'cur_step': int(k),
             'goal_step': int(goal_step),
+            # which goal this sample targets: -1 = goal A (no covis, always novel),
+            # 0 = goal B (leg 2), 1 = goal C (leg 3), ... — for action-loss bucketing
+            # by leg depth in the trainer. Independent of whether THIS sample's k
+            # happened to land inside/outside the covis window (that's null_pos).
+            'goal_j': int(s['goal_j']),
         }
 
 
@@ -524,6 +529,7 @@ def memnav_collate_fn(batch):
         'rgb_dirs':              [b['rgb_dir'] for b in batch],
         'cur_steps':             [b['cur_step'] for b in batch],
         'goal_steps':            [b['goal_step'] for b in batch],
+        'goal_js':               [b['goal_j'] for b in batch],   # -1=goal A, 0=goal B (leg2), 1=goal C (leg3), ...
     }
 
 

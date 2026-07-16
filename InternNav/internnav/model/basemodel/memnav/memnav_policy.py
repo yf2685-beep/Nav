@@ -350,6 +350,7 @@ class MemNavNet(nn.Module):
             noise_pred=noise_pred, noise=noise,
             aux_pose=aux_pose, R_rel=R_rel, ret_logits=enc["ret_logits"], revisit_gate=gate,
             gate_logit=enc["gate_logit"], match_idx=enc["match_idx"], anchor_idx=enc["anchor_idx"],
+            goal_anchor_idx=enc["goal_anchor_idx"],
         )
 
     @torch.no_grad()
@@ -418,7 +419,7 @@ class MemNavNet(nn.Module):
 
         B = len(batch["cache_paths"])
         lo = self.num_scale + self.window - 1
-        cur_t, dfeat_t, curp, goalp = [], [], [], []
+        cur_t, dfeat_t, curp, goalp, goal_m = [], [], [], [], []
         for b in range(B):
             k = int(batch["cur_steps"][b])
             rgb_dir = batch["rgb_dirs"][b]
@@ -446,6 +447,7 @@ class MemNavNet(nn.Module):
                 goal_pose = self.lingbot.camera_pose(ck, cv, m + 1, goal_agg)[-1]   # [9] goal abs pose
                 # (3) novel branch runs on raw images (batched, in forward) — no live dino needed
             cur_t.append(cur); dfeat_t.append(dfeat); curp.append(cur_pose); goalp.append(goal_pose)
+            goal_m.append(m)   # post-clamp anchor actually used for goal_pose (may differ from anchor[b])
 
         return dict(
             current=torch.stack(cur_t),      # [B, P, 2C]    post-GCT (RGBD branch)
@@ -454,6 +456,7 @@ class MemNavNet(nn.Module):
             goal_pose=torch.stack(goalp),    # [B, 9]        goal absolute camera pose (map frame)
             match_idx=match_idx, anchor_idx=anchor, revisit_gate=revisit_gate,
             gate_logit=gate_logit, ret_logits=ret_logits,
+            goal_anchor_idx=torch.tensor(goal_m, device=dev, dtype=torch.long),  # [B] post-clamp m used for goal_pose
         )
 
 

@@ -41,9 +41,14 @@ class MemNavTrainer(BaseTrainer):
         dev = next(model.parameters()).device
         fwd = model(inputs)                                       # forward(batch) moves tensors internally
 
-        # --- diffusion action loss (always goal-conditioned) ---
+        # --- diffusion action loss (always goal-conditioned). Kept per-sample first
+        # (mean over predict_size/action-dim only) so it can be bucketed by
+        # novel/leg2/leg3 below; action_loss itself is unchanged (mean of per-sample
+        # means == the old flat .mean() since every sample has the same [predict_size,3]
+        # shape, no padding). ---
         noise = fwd["noise"]
-        action_loss = (fwd["noise_pred"] - noise).square().mean()
+        per_action_loss = (fwd["noise_pred"] - noise).square().mean(dim=(-2, -1))  # [B]
+        action_loss = per_action_loss.mean()
 
         # --- retrieval: DECOUPLED ranking (InfoNCE) + revisit gate (BCE) ---
         # A joint softmax with a null slot collapses to always-null (the easy shortcut),
@@ -83,8 +88,31 @@ class MemNavTrainer(BaseTrainer):
                 + self.w_gate * gate_loss + self.w_aux * aux_loss)
 
         with torch.no_grad():
+            # --- action-loss split by goal category: overall (already `action_loss`),
+            # novel (revisit==0 — goal A + any covis goal B/C that landed novel for this
+            # sample's k), leg2 (revisit goal B, goal_j==0), leg3+ (revisit goal C or
+            # deeper, goal_j>=1). goal_j is the dataset's fixed which-goal label, NOT
+            # the same axis as the shallow/deep recall_gap split above (a leg2 sample
+            # can still be a "deep" recall_gap and vice versa) — this answers "does the
+            # action head specifically do worse navigating leg 3" as asked, independent
+            # of pose-head accuracy.
+            goal_j_t = torch.tensor(inputs["goal_js"], device=dev, dtype=torch.float32)
+            is_novel_row = 1.0 - revisit
+            is_leg2 = revisit * (goal_j_t == 0).float()
+            is_leg3 = revisit * (goal_j_t >= 1).float()
+            n_novel_raw, n_leg2_raw, n_leg3_raw = is_novel_row.sum(), is_leg2.sum(), is_leg3.sum()
+            has_novel = bool(n_novel_raw.item() > 0.5)
+            has_leg2 = bool(n_leg2_raw.item() > 0.5)
+            has_leg3 = bool(n_leg3_raw.item() > 0.5)
+            n_novel, n_leg2, n_leg3 = (n_novel_raw.clamp(min=1.0), n_leg2_raw.clamp(min=1.0),
+                                       n_leg3_raw.clamp(min=1.0))
+            action_loss_novel = (per_action_loss * is_novel_row).sum() / n_novel
+            action_loss_leg2 = (per_action_loss * is_leg2).sum() / n_leg2
+            action_loss_leg3 = (per_action_loss * is_leg3).sum() / n_leg3
             gate_prob = torch.sigmoid(gate_logit)                # [B] P(revisit)
-            ns = revisit.sum().clamp(min=1.0)
+            n_revisit_raw = revisit.sum()                         # UNclamped — 0 iff this batch has no revisit rows
+            has_revisit = bool(n_revisit_raw.item() > 0.5)
+            ns = n_revisit_raw.clamp(min=1.0)
             nu = (1.0 - revisit).sum().clamp(min=1.0)
             gate_seen = (gate_prob * revisit).sum() / ns          # → 1 (visited)
             gate_unseen = (gate_prob * (1.0 - revisit)).sum() / nu  # → 0 (novel)
@@ -121,18 +149,62 @@ class MemNavTrainer(BaseTrainer):
             cos_ang = (((R_rel_conv * gt_rot).sum(dim=(-2, -1)) - 1) / 2).clamp(-1, 1)
             rot_err_deg = torch.rad2deg(torch.arccos(cos_ang))          # [B]
             rot_err = (rot_err_deg * revisit).sum() / ns                # masked mean, revisit rows only
+
+            # --- shallow/deep split of the same revisit-only diagnostics, bucketed by
+            # recall_gap = cur_step - goal_anchor_idx (frames between "now" and the matched
+            # revisit frame). Answers "is the error coming from deep (long-gap) revisits" --
+            # recall_gap, not leg-count, is the actual mechanism the offline sweep pinned
+            # down (149-frame gap -> ~3 deg dir error; 291-frame gap -> up to 114 deg), and
+            # it's confound-free (a 3-leg goal B can have a short gap; bucketing by leg
+            # would blur that). goal_anchor_idx is the POST-CLAMP anchor actually fed to
+            # goal_append_warm/camera_pose (memnav_policy.py encode_memory) -- not the raw
+            # teacher-forced anchor_idx, which can differ when anchor < lo.
+            DEEP_GAP = 200.0
+            cur_step_t = torch.tensor(inputs["cur_steps"], device=dev, dtype=torch.float32)
+            recall_gap = cur_step_t - fwd["goal_anchor_idx"].float()
+            is_deep = revisit * (recall_gap >= DEEP_GAP).float()
+            is_shallow = revisit * (recall_gap < DEEP_GAP).float()
+            n_deep_raw, n_shallow_raw = is_deep.sum(), is_shallow.sum()
+            has_deep = bool(n_deep_raw.item() > 0.5)
+            has_shallow = bool(n_shallow_raw.item() > 0.5)
+            n_deep, n_shallow = n_deep_raw.clamp(min=1.0), n_shallow_raw.clamp(min=1.0)
+            pos_err_m_deep = (pos_err * is_deep).sum() / n_deep
+            pos_err_m_shallow = (pos_err * is_shallow).sum() / n_shallow
+            pos_dir_err_deep = (pos_dir_err_deg * is_deep).sum() / n_deep
+            pos_dir_err_shallow = (pos_dir_err_deg * is_shallow).sum() / n_shallow
+            rot_err_deep = (rot_err_deg * is_deep).sum() / n_deep
+            rot_err_shallow = (rot_err_deg * is_shallow).sum() / n_shallow
+            aux_loss_deep = (per * is_deep).sum() / n_deep
+            aux_loss_shallow = (per * is_shallow).sum() / n_shallow
         outputs = dict(loss=loss, action_loss=action_loss,
                        retrieval_loss=rank_loss, gate_loss=gate_loss, aux_loss=aux_loss,
                        gate_seen=gate_seen, gate_unseen=gate_unseen, gate_sep=gate_sep,
                        gate_acc=gate_acc, seen_match_acc=seen_match, rot_err_deg=rot_err,
-                       pos_err_m=pos_err_m, pos_dir_err_deg=pos_dir_err)
+                       pos_err_m=pos_err_m, pos_dir_err_deg=pos_dir_err,
+                       action_loss_novel=action_loss_novel, action_loss_leg2=action_loss_leg2,
+                       action_loss_leg3=action_loss_leg3)
         if (dist.get_rank() if dist.is_initialized() else 0) == 0:
+            revisit_part = (f"pos_err={pos_err_m.item():.2f}m dir_err={pos_dir_err.item():.1f}deg "
+                            f"rot_err={rot_err.item():.1f}deg aux={aux_loss.item():.4f} "
+                            f"match={seen_match.item():.2f}" if has_revisit else
+                            "no revisit rows this batch (pos/rot/aux/match skipped)")
+            depth_part = ' '.join(filter(None, [
+                f"shallow(n={int(n_shallow_raw.item())}): pos={pos_err_m_shallow.item():.2f}m "
+                f"rot={rot_err_shallow.item():.1f}deg" if has_shallow else '',
+                f"deep(n={int(n_deep_raw.item())}): pos={pos_err_m_deep.item():.2f}m "
+                f"rot={rot_err_deep.item():.1f}deg" if has_deep else '',
+            ]))
+            action_part = ' '.join(filter(None, [
+                f"novel(n={int(n_novel_raw.item())})={action_loss_novel.item():.4f}" if has_novel else '',
+                f"leg2(n={int(n_leg2_raw.item())})={action_loss_leg2.item():.4f}" if has_leg2 else '',
+                f"leg3(n={int(n_leg3_raw.item())})={action_loss_leg3.item():.4f}" if has_leg3 else '',
+            ]))
             print(f"[Step {self.state.global_step}] loss={loss.item():.4f} act={action_loss.item():.4f} "
-                  f"rank={rank_loss.item():.4f} gate={gate_loss.item():.4f} aux={aux_loss.item():.4f} | "
+                  f"rank={rank_loss.item():.4f} gate={gate_loss.item():.4f} | "
                   f"gate seen={gate_seen.item():.2f} unseen={gate_unseen.item():.2f} sep={gate_sep.item():+.2f} "
-                  f"acc={gate_acc.item():.2f} | match seen={seen_match.item():.2f} | "
-                  f"pos_err={pos_err_m.item():.2f}m dir_err={pos_dir_err.item():.1f}deg "
-                  f"rot_err={rot_err.item():.1f}deg")
+                  f"acc={gate_acc.item():.2f} | {revisit_part}"
+                  + (f" | {depth_part}" if depth_part else "")
+                  + (f" | act: {action_part}" if action_part else ""))
 
         # Per-component metrics → wandb/tb. self.log is rank-0-only inside HF Trainer;
         # gate by logging_steps to match train/loss cadence and avoid extra .item() syncs.
@@ -141,16 +213,50 @@ class MemNavTrainer(BaseTrainer):
                 'train/action_loss': action_loss.item(),
                 'train/retrieval_loss': rank_loss.item(),
                 'train/gate_loss': gate_loss.item(),
-                'train/aux_loss': aux_loss.item(),
                 'train/gate_acc': gate_acc.item(),
                 'train/gate_seen': gate_seen.item(),
                 'train/gate_unseen': gate_unseen.item(),
                 'train/gate_sep': gate_sep.item(),
-                'train/seen_match_acc': seen_match.item(),
-                'train/rot_err_deg': rot_err.item(),
-                'train/pos_err_m': pos_err_m.item(),
-                'train/pos_dir_err_deg': pos_dir_err.item(),
             }
+            # revisit-only metrics (aux_loss, rot_err_deg, pos_err_m, pos_dir_err_deg,
+            # seen_match_acc): only logged when this batch actually contains revisit rows
+            # -- otherwise the masked-mean formula silently reports 0 (0/clamp(0,min=1)),
+            # and logging that 0 as a real data point would dilute/distort the wandb curve
+            # instead of giving a clean signal of revisit-case accuracy specifically.
+            if has_revisit:
+                log_payload.update({
+                    'train/aux_loss': aux_loss.item(),
+                    'train/seen_match_acc': seen_match.item(),
+                    'train/rot_err_deg': rot_err.item(),
+                    'train/pos_err_m': pos_err_m.item(),
+                    'train/pos_dir_err_deg': pos_dir_err.item(),
+                })
+            # same revisit-only diagnostics, split by recall_gap (see above) -- each half
+            # gated independently since a bucket can be empty even when has_revisit is True
+            # (a batch with one shallow revisit row and zero deep ones, or vice versa).
+            if has_shallow:
+                log_payload.update({
+                    'train/aux_loss_shallow': aux_loss_shallow.item(),
+                    'train/rot_err_deg_shallow': rot_err_shallow.item(),
+                    'train/pos_err_m_shallow': pos_err_m_shallow.item(),
+                    'train/pos_dir_err_deg_shallow': pos_dir_err_shallow.item(),
+                })
+            if has_deep:
+                log_payload.update({
+                    'train/aux_loss_deep': aux_loss_deep.item(),
+                    'train/rot_err_deg_deep': rot_err_deep.item(),
+                    'train/pos_err_m_deep': pos_err_m_deep.item(),
+                    'train/pos_dir_err_deg_deep': pos_dir_err_deep.item(),
+                })
+            # action loss split by goal category (see is_novel_row/is_leg2/is_leg3 above) --
+            # goal_j-based (which goal), NOT the same axis as the shallow/deep recall_gap
+            # split. Each gated independently, same 0-dilution guard as everything above.
+            if has_novel:
+                log_payload['train/action_loss_novel'] = action_loss_novel.item()
+            if has_leg2:
+                log_payload['train/action_loss_leg2'] = action_loss_leg2.item()
+            if has_leg3:
+                log_payload['train/action_loss_leg3'] = action_loss_leg3.item()
             if dev.type == 'cuda':
                 # Peak since previous logging_step, in GiB. Reset right after so the
                 # next window measures its own peak — otherwise max_ stays monotone.
