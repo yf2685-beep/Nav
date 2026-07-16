@@ -11,7 +11,6 @@
 #SBATCH --partition=a100_tandon,h100_tandon,h200_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --export=ALL
-# REQUIRED: complete scripts/train_memnav/README.md before every sbatch submission.
 #
 # Offline CLS-separation probe (scripts/diag_cls_separation.py) inside the SAME
 # apptainer overlay training uses — frames + goal_{j}.jpg live in the squashfs,

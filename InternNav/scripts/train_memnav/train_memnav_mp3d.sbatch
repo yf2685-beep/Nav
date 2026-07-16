@@ -11,7 +11,6 @@
 #SBATCH --partition=a100_tandon,h100_tandon,h200_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --export=ALL
-# REQUIRED: complete scripts/train_memnav/README.md before every sbatch submission.
 #
 # MemNav training on the PACKED mp3d revisit data (scenes 0-53).
 #
