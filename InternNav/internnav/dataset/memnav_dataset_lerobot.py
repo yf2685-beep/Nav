@@ -117,6 +117,7 @@ class MemNav_Dataset(NavDP_Base_Datset):
         exclude_recent=83,
         goal_slack=4,
         add_goalA=True,
+        max_legs=None,
         pred_digit=4,
         random_digit=False,
         feature_filename='lingbot_cache.npz',
@@ -160,6 +161,10 @@ class MemNav_Dataset(NavDP_Base_Datset):
         self.exclude_recent = int(exclude_recent)
         self.goal_slack = int(goal_slack)   # min forward frames current(k) -> goal_step
         self.add_goalA = bool(add_goalA)
+        # Keep only episodes with n_legs <= max_legs (n_legs = #goals + 1). None = keep
+        # all. max_legs=2 restricts training to two-leg episodes (goal A + goal B), i.e.
+        # drops the three-leg (goal C) episodes the generator interleaves in the same tree.
+        self.max_legs = int(max_legs) if max_legs is not None else None
         self.meta_filename = meta_filename
         self.pred_digit = pred_digit
         self.random_digit = random_digit
@@ -274,6 +279,10 @@ class MemNav_Dataset(NavDP_Base_Datset):
             return []
         goals = meta.get('goals') or []
         switches = meta.get('switches') or []
+        # leg filter (MEMNAV_MAX_LEGS): n_legs = #goals + 1. Skip the whole episode
+        # if it is deeper than max_legs -> returning [] drops it from enumeration.
+        if self.max_legs is not None and (len(goals) + 1) > self.max_legs:
+            return []
         n_frames = int(meta.get('n_frames', 0))
         pos_hi = float(meta.get('covis_pos_hi', self.covis_pos_hi))
         pos_lo = float(meta.get('covis_pos_lo', self.covis_pos_lo))

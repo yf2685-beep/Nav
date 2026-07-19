@@ -27,6 +27,12 @@ _FEATURE_ROOT = os.environ.get('MEMNAV_FEATURE_ROOT') or None
 _WINDOW_SIZE = int(os.environ.get('MEMNAV_WINDOW', '32'))
 _NUM_SCALE = int(os.environ.get('MEMNAV_NUM_SCALE', '8'))
 _MAX_FRAME_NUM = int(os.environ.get('MEMNAV_MAX_FRAME_NUM', '2048'))
+# Restrict to episodes with n_legs <= MEMNAV_MAX_LEGS (unset or 0 = keep all; 2 = two-leg only).
+_MAX_LEGS = int(os.environ.get('MEMNAV_MAX_LEGS') or 0) or None
+# Step-based checkpointing: save every N optimizer steps so a wall-clock timeout banks
+# recent progress (epoch-based saves never fired — runs die mid-epoch-0). Non-None here
+# switches train.py to save_strategy='steps' for memnav (other models stay on 'epoch').
+_SAVE_STEPS = int(os.environ.get('MEMNAV_SAVE_STEPS', '100'))
 
 memnav_exp_cfg = ExpCfg(
     name='memnav_train',
@@ -58,6 +64,7 @@ memnav_exp_cfg = ExpCfg(
         weight_decay=1e-4,
         warmup_ratio=0.05,
         save_interval_epochs=5,
+        save_interval_steps=_SAVE_STEPS,
         save_filter_frozen_weights=True,
         load_from_ckpt=False,
         ckpt_to_load='',
@@ -75,6 +82,8 @@ memnav_exp_cfg = ExpCfg(
         window_size=_WINDOW_SIZE,
         num_scale=_NUM_SCALE,
         max_frame_num=_MAX_FRAME_NUM,
+        # episode leg filter (None = all legs; 2 = two-leg episodes only)
+        max_legs=_MAX_LEGS,
         # goal_append_warm's live-recompute depth before streaming the goal (deeper than
         # window_size on purpose): window_size's cold start at the window boundary starves
         # the goal's pose estimate (no real predecessors); goal_warm=64 empirically matches

@@ -419,35 +419,73 @@ class MemNavNet(nn.Module):
 
         B = len(batch["cache_paths"])
         lo = self.num_scale + self.window - 1
-        cur_t, dfeat_t, curp, goalp, goal_m = [], [], [], [], []
-        for b in range(B):
-            k = int(batch["cur_steps"][b])
-            rgb_dir = batch["rgb_dirs"][b]
-            goal_img = batch["batch_goal_image"][b].to(dev)
-            win_img = batch["batch_window_images"][b].to(dev)
+        # MEMNAV_STREAM_GROUP: how many trajectories' streams to run on the batch dim
+        # at once. 1 (default) = the original one-at-a-time loop (byte-identical path).
+        # >1 collapses the per-sample window_forward into the aggregator's batch axis
+        # for a ~G-fold throughput gain, at the cost of ~G resident KV caches — the
+        # loop still processes the batch in chunks of G so peak memory is bounded to G.
+        G = max(1, int(os.environ.get("MEMNAV_STREAM_GROUP", "1")))
+        ks = [int(batch["cur_steps"][b]) for b in range(B)]
+        cur_t = [None] * B; dfeat_t = [None] * B
+        curp = [None] * B; goalp = [None] * B; goal_m = [None] * B
+        for s in range(0, B, G):
+            idx = list(range(s, min(s + G, B)))
             with torch.no_grad():
-                cache = self._load_cache(batch["cache_paths"][b], rgb_dir)
-                ck, cv = cache["cam_k"], cache["cam_v"]
-                # (1) current state: post-GCT tokens + depth-head geometry + pose feature
-                #  wt: window tokens [W, P, 2C], cur_agg: current frame's multi-layer agg, psi: patch_start_idx
-                wt, cur_agg, psi = self.lingbot.window_forward(cache, win_img, k, return_multilayer=True)
-                cur = wt[-1]                                                        # [P, 2C]
-                dfeat = self.lingbot.depth_feature(cur_agg, win_img[-1:][None], psi)  # [Pf, Cd]
-                # cur_pose: read the precomputed continuous-stream pose directly (exact,
-                # no cold-start reconstruction) — k is always a real trajectory frame.
-                cur_pose = cache["cam_pose_enc"][k]                                  # [9] current abs pose
-                # (2) revisit: goal_append_warm at the anchor frame (clamped valid) -> goal abs pose.
-                # Deep warm-recompute (self.goal_warm, not the nominal window W) before streaming
-                # the goal — window_forward's cold start at the W boundary starves the goal's pose
-                # estimate; goal_warm=64 empirically matches a true continuous-stream oracle (see
-                # LingBotStream.goal_append_warm / scripts/diag_lingbot_pose_accuracy.py).
-                m = int(anchor[b].clamp(lo, k - 1).item())
-                _, goal_agg = self.lingbot.goal_append_warm(goal_img, cache, m, rgb_dir,
-                                                            self.goal_warm, return_agg=True)
-                goal_pose = self.lingbot.camera_pose(ck, cv, m + 1, goal_agg)[-1]   # [9] goal abs pose
-                # (3) novel branch runs on raw images (batched, in forward) — no live dino needed
-            cur_t.append(cur); dfeat_t.append(dfeat); curp.append(cur_pose); goalp.append(goal_pose)
-            goal_m.append(m)   # post-clamp anchor actually used for goal_pose (may differ from anchor[b])
+                caches = [self._load_cache(batch["cache_paths"][b], batch["rgb_dirs"][b]) for b in idx]
+                wig = batch["batch_window_images"][idx].to(dev)                     # [g, W, 3, H, W]
+                # (1) current state: post-GCT tokens + depth-head geometry.
+                if len(idx) == 1:
+                    # singleton (G==1, or the odd tail group): original scalar path.
+                    b = idx[0]
+                    wt, cur_agg, psi = self.lingbot.window_forward(caches[0], wig[0], ks[b], return_multilayer=True)
+                    cur_t[b] = wt[-1]                                               # [P, 2C]
+                    dfeat_t[b] = self.lingbot.depth_feature(cur_agg, wig[0][-1:][None], psi)  # [Pf, Cd]
+                else:
+                    # batched: G streams stacked on the batch dim (one pass streams all).
+                    kg = [ks[b] for b in idx]
+                    curb, cur_aggb, psi = self.lingbot.window_forward_batched(caches, wig, kg, return_multilayer=True)
+                    dfeatb = self.lingbot.depth_feature_batched(cur_aggb, wig[:, -1:], psi)   # [g, Pf, Cd]
+                    for jj, b in enumerate(idx):
+                        cur_t[b] = curb[jj]; dfeat_t[b] = dfeatb[jj]
+                # (2) cur_pose (direct read) + anchor m per sample.
+                warm, S = self.goal_warm, self.num_scale
+                m_of = {}
+                for jj, b in enumerate(idx):
+                    k = ks[b]
+                    # cur_pose: read the precomputed continuous-stream pose directly (exact,
+                    # no cold-start reconstruction) — k is always a real trajectory frame.
+                    curp[b] = caches[jj]["cam_pose_enc"][k]                         # [9] current abs pose
+                    m = int(anchor[b].clamp(lo, k - 1).item())
+                    m_of[b] = m
+                    goal_m[b] = m   # post-clamp anchor actually used for goal_pose (may differ from anchor[b])
+                # (3) revisit goal pose: goal_append_warm at the anchor (deep warm-recompute,
+                # self.goal_warm, not the nominal W — its cold start starves the goal's pose;
+                # goal_warm=64 matches a continuous-stream oracle). The warm-frame count
+                # L = m - max(num_scale, m-warm+1) + 1 varies per sample AND the replay evicts,
+                # so batch only LOCKSTEP groups (equal L); singletons take the scalar path.
+                # camera_pose stays per-sample (cheap: one camera-head forward).
+                groups = {}
+                for jj, b in enumerate(idx):
+                    L = m_of[b] - max(S, m_of[b] - warm + 1) + 1
+                    groups.setdefault(L, []).append((jj, b))
+                for members in groups.values():
+                    if len(members) == 1:
+                        jj, b = members[0]
+                        cache = caches[jj]
+                        goal_img = batch["batch_goal_image"][b].to(dev)
+                        _, goal_agg = self.lingbot.goal_append_warm(goal_img, cache, m_of[b],
+                                                                    batch["rgb_dirs"][b], warm, return_agg=True)
+                        goalp[b] = self.lingbot.camera_pose(cache["cam_k"], cache["cam_v"],
+                                                            m_of[b] + 1, goal_agg)[-1]
+                    else:
+                        gc = [caches[jj] for jj, b in members]
+                        gms = [m_of[b] for jj, b in members]
+                        grgb = [batch["rgb_dirs"][b] for jj, b in members]
+                        ggoal = torch.stack([batch["batch_goal_image"][b] for jj, b in members], 0).to(dev)
+                        _, aggs = self.lingbot.goal_append_warm_batched(ggoal, gc, gms, grgb, warm, return_agg=True)
+                        for (jj, b), agg in zip(members, aggs):
+                            goalp[b] = self.lingbot.camera_pose(caches[jj]["cam_k"], caches[jj]["cam_v"],
+                                                                m_of[b] + 1, agg)[-1]  # [9] goal abs pose
 
         return dict(
             current=torch.stack(cur_t),      # [B, P, 2C]    post-GCT (RGBD branch)

@@ -328,6 +328,161 @@ class LingBotStream(nn.Module):
         return feat.flatten(1).transpose(0, 1).float()     # [Hf*Wf, C]
 
     # ------------------------------------------------------------------ #
+    # BATCHED window-forward: run G independent streams on the batch dim
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _inject_batched(self, caches, n_hist_list, f_start_list):
+        """Inject G independent per-sample caches stacked on the batch dim, so a
+        single streaming pass advances all G streams at once.
+
+        Each sample b has its own scale KV (uniform ``num_scale`` frames) and a
+        history-special block of length ``n_hist_b`` that VARIES per sample; the
+        specials are right-padded to ``max_n_hist`` and the injected padding region
+        [n_hist_b*6, max_n_hist*6) is masked out at attention time (kv_cache
+        '_special_pad_lo'/'_special_pad_hi'). Per-sample temporal offsets
+        ``f_start_list`` are handed to the aggregator via ``agg._batched_f_start`` so
+        3D-RoPE places each stream's frames at the right absolute slots. Used for
+        both the window replay (f_start = k-W+1) and the goal warm-up (f_start =
+        max(num_scale, m-warm+1)).
+
+          caches       : list of G dicts (from ``MemNavNet._load_cache``): scale_k/v
+                         [L,H,num_scale,P,d], anchor_k/v [L,H,n_hist_b,6,d].
+          n_hist_list  : G history-frame counts (specials injected per sample).
+          f_start_list : G absolute temporal offsets of the FIRST streamed frame.
+        Returns max_n_hist (int).
+        """
+        G = len(caches)
+        n_hist = [max(0, int(x)) for x in n_hist_list]
+        max_n_hist = max(n_hist)
+
+        self.model.clean_kv_cache()
+        kv = self.agg.kv_cache
+        for i in range(self.depth):
+            kv[f"k_{i}"] = torch.stack([caches[b]["scale_k"][i] for b in range(G)], 0)  # [G,H,S,P,d]
+            kv[f"v_{i}"] = torch.stack([caches[b]["scale_v"][i] for b in range(G)], 0)
+            if max_n_hist > 0:
+                ak, av = [], []
+                for b in range(G):
+                    a = caches[b]["anchor_k"][i, :, :n_hist[b]]   # [H, n_hist_b, 6, d]
+                    v = caches[b]["anchor_v"][i, :, :n_hist[b]]
+                    pad = max_n_hist - n_hist[b]
+                    if pad > 0:                                    # right-pad the frame axis
+                        a = torch.nn.functional.pad(a, (0, 0, 0, 0, 0, pad))
+                        v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad))
+                    ak.append(a); av.append(v)
+                kv[f"k_{i}_special"] = torch.stack(ak, 0)          # [G,H,max_n_hist,6,d]
+                kv[f"v_{i}_special"] = torch.stack(av, 0)
+
+        dev = kv[f"k_0"].device
+        self.agg._batched_f_start = torch.tensor([int(x) for x in f_start_list],
+                                                 device=dev, dtype=torch.long)
+        if max_n_hist > 0:
+            kv["_special_pad_lo"] = torch.tensor([n_hist[b] * 6 for b in range(G)],
+                                                 device=dev, dtype=torch.long)
+            kv["_special_pad_hi"] = torch.tensor(max_n_hist * 6, device=dev, dtype=torch.long)
+        return max_n_hist
+
+    @torch.no_grad()
+    def window_forward_batched(self, caches, window_imgs, ks, return_multilayer=False):
+        """Batched analogue of :meth:`window_forward`. Streams the W window frames
+        for G samples at once (batch dim), collapsing the per-sample Python loop
+        into the aggregator's batch axis.
+
+          caches      : list of G cache dicts (see :meth:`_inject_batched`)
+          window_imgs : [G, W, 3, H, W] (each sample's frames [k-W+1 .. k], ordered)
+          ks          : G current-frame indices
+        Returns the current (last window frame) tokens [G, P, 2C]; if
+        return_multilayer, also (cur_agg, patch_start_idx) with cur_agg a list of
+        [G, 1, P, 2C] per selected layer.
+        """
+        W, S = self.window, self.num_scale
+        G = len(caches)
+        n_hist = [(int(ks[b]) - W + 1) - S for b in range(G)]
+        f_start = [int(ks[b]) - W + 1 for b in range(G)]
+        self._inject_batched(caches, n_hist, f_start)
+        window_imgs = window_imgs.to(self.device)
+        cur_agg = psi = None
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            for j in range(W):
+                a, psi = self.model._aggregate_features(
+                    window_imgs[:, j:j + 1],
+                    num_frame_for_scale=self.num_scale, num_frame_per_block=1,
+                )
+        cur = a[-1][:, -1]                                   # [G, P, 2C] (last frame = current state)
+        if return_multilayer:
+            cur_agg = [layer for layer in a]                 # each [G, 1, P, 2C]
+        self._clear_batched_state()
+        if return_multilayer:
+            return cur, cur_agg, psi
+        return cur
+
+    def _clear_batched_state(self):
+        """Drop the batched-stream markers so subsequent single-stream ops are unaffected."""
+        self.agg._batched_f_start = None
+        self.agg.kv_cache.pop("_special_pad_lo", None)
+        self.agg.kv_cache.pop("_special_pad_hi", None)
+
+    @torch.no_grad()
+    def goal_append_warm_batched(self, goal_imgs, caches, ms, rgb_dirs, warm, return_agg=False):
+        """Batched analogue of :meth:`goal_append_warm` for a LOCKSTEP group: every
+        sample must warm-recompute the SAME number of frames ``L`` (the caller groups
+        by L = m - max(num_scale, m-warm+1) + 1, so the batched stream + sliding-window
+        eviction advance in lockstep). Per-sample variation — different start frame,
+        history length, and temporal offset — is handled by :meth:`_inject_batched`'s
+        per-sample RoPE offsets and padding mask.
+
+          goal_imgs : [G, 3, H, W] goal frames (LingBot-preprocessed)
+          caches    : list of G cache dicts
+          ms        : G anchor indices (goal streamed at m+1)
+          rgb_dirs  : G trajectory frame dirs
+        Returns the goal tokens [G, P, 2C]; if return_agg, also a list (len G) of the
+        per-sample agg lists (each a list of [1, 1, P, 2C]) for ``camera_pose``.
+        """
+        S = self.num_scale
+        G = len(caches)
+        starts = [max(S, int(ms[b]) - warm + 1) for b in range(G)]
+        Ls = [int(ms[b]) - starts[b] + 1 for b in range(G)]
+        assert len(set(Ls)) == 1, f"goal_append_warm_batched needs a lockstep group, got L={Ls}"
+        L = Ls[0]
+        n_hist = [starts[b] - S for b in range(G)]
+        self._inject_batched(caches, n_hist, starts)
+
+        # per-sample warm frames [start_b .. m_b] (L each), stacked on the batch dim
+        warm_imgs = torch.stack([
+            self.load_images([os.path.join(rgb_dirs[b], f"{i}.jpg")
+                              for i in range(starts[b], int(ms[b]) + 1)])
+            for b in range(G)], 0).to(self.device)                 # [G, L, 3, H, W]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            for j in range(L):
+                self.model._aggregate_features(
+                    warm_imgs[:, j:j + 1],
+                    num_frame_for_scale=S, num_frame_per_block=1,
+                )
+            # stream the goal at time m_b+1 (f_start has advanced start_b -> m_b+1)
+            a, _ = self.model._aggregate_features(
+                goal_imgs.to(self.device)[:, None],
+                num_frame_for_scale=S, num_frame_per_block=1,
+            )
+        goal_tok = a[-1][:, -1]                                     # [G, P, 2C]
+        agg_per_sample = None
+        if return_agg:
+            agg_per_sample = [[layer[b:b + 1] for layer in a] for b in range(G)]  # per-b list of [1,1,P,2C]
+        self._clear_batched_state()
+        if return_agg:
+            return goal_tok, agg_per_sample
+        return goal_tok
+
+    @torch.no_grad()
+    def depth_feature_batched(self, cur_agg, cur_imgs, patch_start_idx):
+        """Batched depth-head geometry feature. ``cur_agg`` = list of [G,1,P,2C],
+        ``cur_imgs`` = [G,1,3,H,W]. Returns [G, Hf*Wf, C]."""
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            feat = self.depth_feat_head(cur_agg, cur_imgs.to(self.device), patch_start_idx)  # [G,1,C,Hf,Wf]
+        feat = feat[:, 0]                                    # [G, C, Hf, Wf]
+        G = feat.shape[0]
+        return feat.flatten(2).transpose(1, 2).float()       # [G, Hf*Wf, C]
+
+    # ------------------------------------------------------------------ #
     # goal-append: relocalize the goal in the stream
     # ------------------------------------------------------------------ #
     @torch.no_grad()

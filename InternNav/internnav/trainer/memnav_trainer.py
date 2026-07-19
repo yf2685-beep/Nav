@@ -36,6 +36,80 @@ class MemNavTrainer(BaseTrainer):
         self._C_rot = torch.tensor([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]])
         print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] Model device: {self.model_device}")
 
+        # --- wandb panel organization ---------------------------------- #
+        # HF's WandbCallback runs every logged key through rewrite_logs(), which
+        # force-prefixes it with "train/". That collapses all ~19 of our panels
+        # into a single "train" section. We keep the callback for run setup/finish
+        # but silence its on_log, then re-emit metrics ourselves in log() under the
+        # four sections below. TensorBoard/console/log_history are untouched (they
+        # still flow through super().log()).
+        self._wb = None
+        try:
+            from transformers.integrations import WandbCallback
+            for cb in self.callback_handler.callbacks:
+                if isinstance(cb, WandbCallback):
+                    cb.on_log = lambda *a, **k: None      # no-op: we log to wandb ourselves
+                    self._wb = cb._wandb                  # the wandb module handle
+                    break
+        except Exception as e:
+            print(f"[MemNavTrainer] wandb re-sectioning disabled: {e}")
+
+    # Map bare metric name -> "<section>/<panel>". Four sections:
+    #   retrieval  — ranking + revisit-gate metrics
+    #   pose       — camera-pose (relocalization) errors
+    #   action     — diffusion action loss (overall + per goal category) + total loss
+    #   config     — optimizer/schedule/system knobs
+    # Anything unmapped falls back to "misc/<name>" so nothing is silently dropped.
+    _WB_TARGET = {
+        # (1) retrieval
+        'retrieval_loss': 'retrieval/retrieval_loss',
+        'gate_loss': 'retrieval/gate_loss',
+        'gate_acc': 'retrieval/gate_acc',
+        'gate_seen': 'retrieval/gate_seen',
+        'gate_unseen': 'retrieval/gate_unseen',
+        'gate_sep': 'retrieval/gate_sep',
+        'seen_match_acc': 'retrieval/seen_match_acc',
+        # (2) camera pose
+        'aux_loss': 'pose/aux_loss',
+        'aux_loss_shallow': 'pose/aux_loss_shallow',
+        'aux_loss_deep': 'pose/aux_loss_deep',
+        'rot_err_deg': 'pose/rot_err_deg',
+        'rot_err_deg_shallow': 'pose/rot_err_deg_shallow',
+        'rot_err_deg_deep': 'pose/rot_err_deg_deep',
+        'pos_err_m': 'pose/pos_err_m',
+        'pos_err_m_shallow': 'pose/pos_err_m_shallow',
+        'pos_err_m_deep': 'pose/pos_err_m_deep',
+        'pos_dir_err_deg': 'pose/pos_dir_err_deg',
+        'pos_dir_err_deg_shallow': 'pose/pos_dir_err_deg_shallow',
+        'pos_dir_err_deg_deep': 'pose/pos_dir_err_deg_deep',
+        # (3) action + total loss
+        'loss': 'action/total_loss',
+        'action_loss': 'action/action_loss',
+        'action_loss_novel': 'action/action_loss_novel',
+        'action_loss_leg2': 'action/action_loss_leg2',
+        'action_loss_leg3': 'action/action_loss_leg3',
+        # (4) training config / system
+        'learning_rate': 'config/learning_rate',
+        'grad_norm': 'config/grad_norm',
+        'epoch': 'config/epoch',
+        'mem_alloc_gb': 'config/mem_alloc_gb',
+        'mem_reserved_gb': 'config/mem_reserved_gb',
+    }
+
+    def log(self, logs, *args, **kwargs):
+        # Re-emit to wandb under our four sections (bypassing rewrite_logs' flat
+        # "train/" prefix), then hand the original dict to the parent for
+        # console/TensorBoard/log_history. Guarded on an active run so nothing
+        # breaks under report_to='tensorboard'/'none'.
+        if (self.is_world_process_zero() and self._wb is not None
+                and getattr(self._wb, 'run', None) is not None):
+            sectioned = {}
+            for k, v in logs.items():
+                base = k.split('/')[-1]
+                sectioned[self._WB_TARGET.get(base, f'misc/{base}')] = v
+            self._wb.log(sectioned, step=self.state.global_step)
+        return super().log(logs, *args, **kwargs)
+
     # ------------------------------------------------------------------ #
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         dev = next(model.parameters()).device
@@ -209,14 +283,15 @@ class MemNavTrainer(BaseTrainer):
         # Per-component metrics → wandb/tb. self.log is rank-0-only inside HF Trainer;
         # gate by logging_steps to match train/loss cadence and avoid extra .item() syncs.
         if self.state.global_step % self.args.logging_steps == 0:
+            # Bare metric names; log() re-sections them for wandb (see _WB_TARGET).
             log_payload = {
-                'train/action_loss': action_loss.item(),
-                'train/retrieval_loss': rank_loss.item(),
-                'train/gate_loss': gate_loss.item(),
-                'train/gate_acc': gate_acc.item(),
-                'train/gate_seen': gate_seen.item(),
-                'train/gate_unseen': gate_unseen.item(),
-                'train/gate_sep': gate_sep.item(),
+                'action_loss': action_loss.item(),
+                'retrieval_loss': rank_loss.item(),
+                'gate_loss': gate_loss.item(),
+                'gate_acc': gate_acc.item(),
+                'gate_seen': gate_seen.item(),
+                'gate_unseen': gate_unseen.item(),
+                'gate_sep': gate_sep.item(),
             }
             # revisit-only metrics (aux_loss, rot_err_deg, pos_err_m, pos_dir_err_deg,
             # seen_match_acc): only logged when this batch actually contains revisit rows
@@ -225,45 +300,45 @@ class MemNavTrainer(BaseTrainer):
             # instead of giving a clean signal of revisit-case accuracy specifically.
             if has_revisit:
                 log_payload.update({
-                    'train/aux_loss': aux_loss.item(),
-                    'train/seen_match_acc': seen_match.item(),
-                    'train/rot_err_deg': rot_err.item(),
-                    'train/pos_err_m': pos_err_m.item(),
-                    'train/pos_dir_err_deg': pos_dir_err.item(),
+                    'aux_loss': aux_loss.item(),
+                    'seen_match_acc': seen_match.item(),
+                    'rot_err_deg': rot_err.item(),
+                    'pos_err_m': pos_err_m.item(),
+                    'pos_dir_err_deg': pos_dir_err.item(),
                 })
             # same revisit-only diagnostics, split by recall_gap (see above) -- each half
             # gated independently since a bucket can be empty even when has_revisit is True
             # (a batch with one shallow revisit row and zero deep ones, or vice versa).
             if has_shallow:
                 log_payload.update({
-                    'train/aux_loss_shallow': aux_loss_shallow.item(),
-                    'train/rot_err_deg_shallow': rot_err_shallow.item(),
-                    'train/pos_err_m_shallow': pos_err_m_shallow.item(),
-                    'train/pos_dir_err_deg_shallow': pos_dir_err_shallow.item(),
+                    'aux_loss_shallow': aux_loss_shallow.item(),
+                    'rot_err_deg_shallow': rot_err_shallow.item(),
+                    'pos_err_m_shallow': pos_err_m_shallow.item(),
+                    'pos_dir_err_deg_shallow': pos_dir_err_shallow.item(),
                 })
             if has_deep:
                 log_payload.update({
-                    'train/aux_loss_deep': aux_loss_deep.item(),
-                    'train/rot_err_deg_deep': rot_err_deep.item(),
-                    'train/pos_err_m_deep': pos_err_m_deep.item(),
-                    'train/pos_dir_err_deg_deep': pos_dir_err_deep.item(),
+                    'aux_loss_deep': aux_loss_deep.item(),
+                    'rot_err_deg_deep': rot_err_deep.item(),
+                    'pos_err_m_deep': pos_err_m_deep.item(),
+                    'pos_dir_err_deg_deep': pos_dir_err_deep.item(),
                 })
             # action loss split by goal category (see is_novel_row/is_leg2/is_leg3 above) --
             # goal_j-based (which goal), NOT the same axis as the shallow/deep recall_gap
             # split. Each gated independently, same 0-dilution guard as everything above.
             if has_novel:
-                log_payload['train/action_loss_novel'] = action_loss_novel.item()
+                log_payload['action_loss_novel'] = action_loss_novel.item()
             if has_leg2:
-                log_payload['train/action_loss_leg2'] = action_loss_leg2.item()
+                log_payload['action_loss_leg2'] = action_loss_leg2.item()
             if has_leg3:
-                log_payload['train/action_loss_leg3'] = action_loss_leg3.item()
+                log_payload['action_loss_leg3'] = action_loss_leg3.item()
             if dev.type == 'cuda':
                 # Peak since previous logging_step, in GiB. Reset right after so the
                 # next window measures its own peak — otherwise max_ stays monotone.
                 alloc = torch.cuda.max_memory_allocated(dev) / 2**30
                 reserved = torch.cuda.max_memory_reserved(dev) / 2**30
-                log_payload['train/mem_alloc_gb'] = alloc
-                log_payload['train/mem_reserved_gb'] = reserved
+                log_payload['mem_alloc_gb'] = alloc
+                log_payload['mem_reserved_gb'] = reserved
                 if (dist.get_rank() if dist.is_initialized() else 0) == 0:
                     print(f"[Step {self.state.global_step}] mem peak "
                           f"alloc={alloc:.2f}GiB reserved={reserved:.2f}GiB")
@@ -315,3 +390,24 @@ class MemNavTrainer(BaseTrainer):
         os.makedirs(output_dir, exist_ok=True)
         torch.save(sd, os.path.join(output_dir, "memnav.ckpt"))
         print(f"Saved {len(sd)} trainable tensors to {output_dir}/memnav.ckpt")
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """Resume-time weight load. save_model writes only the trainable heads to
+        memnav.ckpt (no standard HF weight file), so HF's default loader can't find
+        one. Load memnav.ckpt non-strictly — the missing keys are exactly the frozen
+        LingBot backbone, which was already loaded at model construction. HF still
+        restores optimizer/scheduler/global_step/RNG from the checkpoint separately."""
+        if model is None:
+            model = self.model
+        m = model.module if hasattr(model, "module") else model
+        ckpt = os.path.join(resume_from_checkpoint, "memnav.ckpt")
+        if not os.path.isfile(ckpt):
+            raise FileNotFoundError(f"resume checkpoint has no memnav.ckpt: {ckpt}")
+        sd = torch.load(ckpt, map_location="cpu")
+        inc = m.load_state_dict(sd, strict=False)
+        unexpected = list(inc.unexpected_keys)
+        frozen_missing = [k for k in inc.missing_keys if "lingbot." not in k]
+        print(f"[resume] loaded memnav.ckpt: {len(sd)} trainable tensors; "
+              f"unexpected={len(unexpected)} non-lingbot-missing={len(frozen_missing)}")
+        if unexpected or frozen_missing:
+            print(f"[resume] WARN unexpected={unexpected[:5]} non_lingbot_missing={frozen_missing[:5]}")
