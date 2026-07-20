@@ -258,6 +258,7 @@ def main(config, model_class, model_config_class):
                 window_size=getattr(config.il, 'window_size', 8),
                 num_scale=getattr(config.il, 'num_scale', 8),
                 max_legs=getattr(config.il, 'max_legs', None),
+                limit=int(os.environ.get("MEMNAV_LIMIT","0")) or None,
             )
         else:
             if '3dgs' in config.il.lmdb_features_dir or '3dgs' in config.il.lmdb_features_dir:
@@ -330,6 +331,9 @@ def main(config, model_class, model_config_class):
             # else fall back to the original per-epoch saving (cma/navdp/rdp/...).
             save_strategy='steps' if getattr(config.il, 'save_interval_steps', None) else 'epoch',
             save_steps=getattr(config.il, 'save_interval_steps', None) or config.il.save_interval_epochs,
+            # MEMNAV_MAX_STEPS caps the run for short probe/smoke runs; -1 = use epochs.
+            # Kept from our local tree — upstream has no equivalent.
+            max_steps=int(os.environ.get('MEMNAV_MAX_STEPS', '-1')),
             save_total_limit=8,
             report_to=config.il.report_to,
             seed=0,
@@ -355,6 +359,8 @@ def main(config, model_class, model_config_class):
         # Auto-resume: if a prior job left a checkpoint in output_dir, continue from the
         # latest one (restores trainable heads via the trainer's _load_from_checkpoint
         # override + optimizer/scheduler/global_step/RNG via HF). None => fresh start.
+        # (Upstream's implementation supersedes our earlier local glob-based hack, which
+        # passed a bool and so never restored the trainable heads.)
         from transformers.trainer_utils import get_last_checkpoint
         last_ckpt = get_last_checkpoint(config.output_dir) if os.path.isdir(config.output_dir) else None
         if last_ckpt:
