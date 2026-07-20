@@ -70,29 +70,38 @@ class NavDP_RGBD_Backbone(nn.Module):
                  image_size=224,
                  embed_size=512,
                  memory_size=8,
+                 use_depth=True,
                  device='cuda:0'):
         super().__init__()
         self.device = device
         self.memory_size = memory_size
         self.image_size = image_size
         self.embed_size = embed_size
+        # Stage 1: when use_depth=False the trajectory backbone is RGB-only — the
+        # standalone depth encoder + depth-token fusion are dropped from the
+        # forward graph. The LingBot/Pi3 state_encoder keeps its own depth metric
+        # prior independently; raw depth still flows to the collision critic.
+        self.use_depth = use_depth
         model_configs = {'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}}
         self.rgb_model = DepthAnythingV2(**model_configs['vits'])
         self.rgb_model = self.rgb_model.pretrained.float()
         self.preprocess_mean = torch.tensor([0.485,0.456,0.406],dtype=torch.float32)
         self.preprocess_std = torch.tensor([0.229,0.224,0.225],dtype=torch.float32)
         self.rgb_model.eval()
-        
-        self.depth_model = DepthAnythingV2(**model_configs['vits'])
-        self.depth_model = self.depth_model.pretrained.float()
-        self.depth_model.eval()
+
+        if self.use_depth:
+            self.depth_model = DepthAnythingV2(**model_configs['vits'])
+            self.depth_model = self.depth_model.pretrained.float()
+            self.depth_model.eval()
+        # former_pe sized for the RGB+depth budget ((memory_size+1)*264); RGB-only
+        # just indexes the first memory_size*264 rows (checkpoint-compatible).
         self.former_query = LearnablePositionalEncoding(384,self.memory_size)
-        self.former_pe = LearnablePositionalEncoding(384,(self.memory_size+1)*264) 
+        self.former_pe = LearnablePositionalEncoding(384,(self.memory_size+1)*264)
         self.former_net = nn.TransformerDecoder(nn.TransformerDecoderLayer(384,8,batch_first=True),2)
         self.project_layer = nn.Linear(384,embed_size)
-        
-    def forward(self,images,depths):
-        # Perceiver-style compression: M RGB + 1 depth frame -> M fused memory tokens.                                                                                                                                   
+
+    def forward(self,images,depths=None):
+        # Perceiver-style compression: M RGB (+ 1 depth) frame -> M fused memory tokens.
         # Resolution locked to 168x308 (12x22 = 264 patches) by former_pe.
 
         # --- ViT patch tokens: images (B, M, H, W, 3) -> (B, M*264, 384) ---
@@ -103,14 +112,21 @@ class NavDP_RGBD_Backbone(nn.Module):
         tensor_norm_images = (tensor_images - self.preprocess_mean.reshape(1,3,1,1).to(self.device))/self.preprocess_std.reshape(1,3,1,1).to(self.device)
         image_token = self.rgb_model.get_intermediate_layers(tensor_norm_images)[0].reshape(B,T*264,-1)
 
-        # --- Depth uses the same DinoV2-S, triplicated to 3 channels: (B, 264, 384) --- 
-        tensor_depths = torch.as_tensor(depths,dtype=torch.float32,device=self.device).permute(0,3,1,2)
-        tensor_depths = tensor_depths.reshape(-1,1,H,W)
-        tensor_depths = torch.concat([tensor_depths,tensor_depths,tensor_depths],dim=1)
-        depth_token = self.depth_model.get_intermediate_layers(tensor_depths)[0]
-        
-        # -- M learnable query slots (one per memory frame, zeros input -> PE only) cross attend to RGB + Depth
-        former_token = torch.concat((image_token,depth_token),dim=1) + self.former_pe(torch.concat((image_token,depth_token),dim=1))
+        if self.use_depth:
+            if depths is None:
+                raise ValueError("NavDP_RGBD_Backbone(use_depth=True) requires a depth tensor")
+            # --- Depth uses the same DinoV2-S, triplicated to 3 channels: (B, 264, 384) ---
+            tensor_depths = torch.as_tensor(depths,dtype=torch.float32,device=self.device).permute(0,3,1,2)
+            tensor_depths = tensor_depths.reshape(-1,1,H,W)
+            tensor_depths = torch.concat([tensor_depths,tensor_depths,tensor_depths],dim=1)
+            depth_token = self.depth_model.get_intermediate_layers(tensor_depths)[0]
+            former_token = torch.concat((image_token,depth_token),dim=1)
+        else:
+            # RGB-only: depth tensor (if passed) is ignored.
+            former_token = image_token
+
+        # -- M learnable query slots (one per memory frame, zeros input -> PE only) cross attend to RGB (+ Depth)
+        former_token = former_token + self.former_pe(former_token)
         former_query = self.former_query(torch.zeros((image_token.shape[0], self.memory_size, 384),device=self.device))
         memory_token = self.former_net(former_query,former_token)
         memory_token = self.project_layer(memory_token)

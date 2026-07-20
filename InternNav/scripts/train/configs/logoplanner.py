@@ -69,6 +69,22 @@ logoplanner_exp_cfg = ExpCfg(
         context_image_width=308,
         depth_max=5.0,
         depth_min=0.1,
+        # Stage 1: RGB-only trajectory backbone (rgbd_encoder drops depth).
+        # The state_encoder (Pi3/LingBot geometry) keeps its depth metric prior,
+        # and the dataloader still emits raw depth for the collision critic.
+        use_depth=False,
+        # Stage 2: LogoPlanner-style sequential streaming dataloader. Default off
+        # (random-segment training, DDP-compatible). Set True to stream episodes
+        # in temporal order for per-episode KV cache (single-process for now).
+        sequential=False,
+        seq_stride=1,
+        # Stage 4: multi-stop subgoal navigation. Conditions on the current
+        # (nearby, usually visible) subgoal instead of the final goal image.
+        # Subgoal every subgoal_dist m, +1 at turns > subgoal_turn_deg.
+        multistop=True,
+        subgoal_dist=1.5,
+        subgoal_turn_deg=30.0,
+        subgoal_arrival=0.5,
         filter_failure=FilterFailure(
             use=True,
             min_rgb_nums=15,

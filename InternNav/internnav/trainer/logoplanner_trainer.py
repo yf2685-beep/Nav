@@ -108,6 +108,7 @@ class LoGoPlannerTrainer(BaseTrainer):
             'local': getattr(w, 'w_local', 0.5),
             'world': getattr(w, 'w_world', 0.5),
             'subgoal': getattr(w, 'w_subgoal', 0.1),
+            'safety': getattr(w, 'w_safety', 0.0),  # Stage 7: collision penalty (default off)
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -121,9 +122,12 @@ class LoGoPlannerTrainer(BaseTrainer):
             'batch_gt_camera_poses', 'batch_gt_local_points',
             'batch_gt_world_points', 'batch_gt_subgoal',
         ]
+        if 'batch_goal_image' in inputs:
+            input_keys.append('batch_goal_image')
         inp = {k: inputs[k].to(model_device, non_blocking=True) for k in input_keys}
         torch.cuda.synchronize(model_device)
 
+        _goal_image = inp.get('batch_goal_image', None)
         out = model(
             inp['batch_pg'],
             inp['batch_memory_rgb'],
@@ -132,6 +136,7 @@ class LoGoPlannerTrainer(BaseTrainer):
             inp['batch_context_depth'],
             inp['batch_labels'],
             inp['batch_augments'],
+            batch_goal_image=_goal_image,
         )
         # out: dict returned by LoGoPlannerNet.forward (train mode), see contract above.
 
@@ -144,9 +149,19 @@ class LoGoPlannerTrainer(BaseTrainer):
             + (out['augment_critic_pred'] - inp['batch_augment_critic']).square().mean()
         )
 
-        pose_loss = (out['camera_poses_pred'] - inp['batch_gt_camera_poses']).square().mean()
-        local_loss = (out['local_points_pred'] - inp['batch_gt_local_points']).square().mean()
-        world_loss = (out['world_points_pred'] - inp['batch_gt_world_points']).square().mean()
+        # Geometry supervision. In streaming mode the backbone window has N frames
+        # (anchor + trajectory + window) while the dense geometry GT is only
+        # provided for the `context_size` reference frames, so shapes differ —
+        # skip the term (the frozen, pretrained LingBot backbone already carries
+        # geometry; per-window GT can be added later to re-enable Stage-1 here).
+        def _geo_mse(pred_key, gt_key):
+            pred, gt = out[pred_key], inp[gt_key]
+            if pred.shape != gt.shape:
+                return torch.zeros((), device=model_device)
+            return (pred - gt).square().mean()
+        pose_loss = _geo_mse('camera_poses_pred', 'batch_gt_camera_poses')
+        local_loss = _geo_mse('local_points_pred', 'batch_gt_local_points')
+        world_loss = _geo_mse('world_points_pred', 'batch_gt_world_points')
 
         subgoal_loss = (out['subgoal_pred'] - inp['batch_gt_subgoal']).square().mean()
 
@@ -160,6 +175,44 @@ class LoGoPlannerTrainer(BaseTrainer):
             + w['subgoal'] * subgoal_loss
         )
 
+        # Stage 7: collision safety penalty on the policy's predicted trajectory.
+        # Only added when w_safety > 0 (default off → pure imitation + inference
+        # reranking). The penalty is geometric + differentiable; gradients update
+        # only the policy (the obstacle cloud is detached). Monitor safety_loss vs
+        # action_loss so safety never dominates — fall back to w_safety=0 if unstable.
+        safety_loss = torch.zeros((), device=model_device)
+        if w['safety'] > 0 and 'pred_traj_mg' in out:
+            try:
+                from collision_critic import differentiable_safety_loss
+                lc = self.config.il.loss
+                foot = getattr(lc, 'safety_footprint', 0.3)
+                margin = getattr(lc, 'safety_margin', 0.3)
+                max_pts = int(getattr(lc, 'safety_max_points', 1024))
+                # obstacle cloud = current (last context) frame's world points, ground-plane xy
+                wp = inp['batch_gt_world_points'][:, -1]               # (B, H, W, 3)
+                B = wp.shape[0]
+                pts = wp.reshape(B, -1, 3)                            # (B, H*W, 3)
+                if pts.shape[1] > max_pts:                            # random subsample
+                    idx = torch.randint(0, pts.shape[1], (max_pts,), device=pts.device)
+                    pts = pts[:, idx, :]
+                valid = pts.norm(dim=-1) > 1e-4                       # (B, P) drop zero/invalid
+                obstacle_xy = pts[..., :2].detach()                  # treat cloud as constant
+                pred_xy = out['pred_traj_mg'][..., :2]               # (B, T, 2) differentiable
+                safety_loss = differentiable_safety_loss(
+                    pred_xy, obstacle_xy, obstacle_mask=valid,
+                    footprint_radius=foot, safety_margin=margin,
+                )
+                loss = loss + w['safety'] * safety_loss
+            except Exception as e:  # never let the safety term crash training
+                print(f"[stage7] safety loss skipped: {e}")
+
+        # Phase α-Fix++: image-goal distillation from start_encoder (teacher).
+        # Stashed by the model's training forward when IMAGEGOAL_MODE=1.
+        _p = model.module.policy if hasattr(model, 'module') else model.policy
+        _img_distill = getattr(_p, '_last_image_distill_loss', None)
+        if _img_distill is not None:
+            loss = loss + 1.0 * _img_distill
+
         outputs = {
             'loss': loss,
             'ng_action_loss': ng_action_loss,
@@ -170,6 +223,7 @@ class LoGoPlannerTrainer(BaseTrainer):
             'local_loss': local_loss,
             'world_loss': world_loss,
             'subgoal_loss': subgoal_loss,
+            'safety_loss': safety_loss,
         }
 
         # --- per-component metrics for wandb/tensorboard ---
@@ -187,12 +241,14 @@ class LoGoPlannerTrainer(BaseTrainer):
                 'train/loss_local_raw':          local_loss,
                 'train/loss_world_raw':          world_loss,
                 'train/loss_subgoal_raw':        subgoal_loss,
+                'train/loss_safety_raw':         safety_loss,
                 'train/loss_diffusion_weighted': w['diffusion'] * action_loss,
                 'train/loss_critic_weighted':    w['critic'] * critic_loss,
                 'train/loss_pose_weighted':      w['pose'] * pose_loss,
                 'train/loss_local_weighted':     w['local'] * local_loss,
                 'train/loss_world_weighted':     w['world'] * world_loss,
                 'train/loss_subgoal_weighted':   w['subgoal'] * subgoal_loss,
+                'train/loss_safety_weighted':    w['safety'] * safety_loss,
             })
         return (loss, outputs) if return_outputs else loss
 
@@ -234,6 +290,25 @@ class LoGoPlannerTrainer(BaseTrainer):
     def get_train_dataloader(self):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
+        # Stage 2: sequential mode streams episodes in temporal order via a
+        # lane-major batch sampler so the model can carry a per-episode KV cache.
+        if getattr(self.train_dataset, 'sequential', False):
+            from internnav.dataset.logoplanner_sequential import StreamingEpisodeBatchSampler
+            if world_size > 1:
+                raise NotImplementedError(
+                    'sequential streaming sampler is single-process for now; '
+                    'launch with one rank (the fixed-window train path supports DDP).'
+                )
+            batch_sampler = StreamingEpisodeBatchSampler(
+                self.train_dataset.episodes, self.config.il.batch_size, drop_ragged_tail=True
+            )
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=batch_sampler,
+                num_workers=self.config.il.num_workers,
+                pin_memory=True,
+                collate_fn=self.data_collator,
+            )
         sampler = DistributedSampler(
             self.train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=1234
         )

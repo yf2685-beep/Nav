@@ -73,10 +73,18 @@ class GeometryModel_LingBot(nn.Module):
         use_sdpa=True,               # SDPA backend = no FlashInfer dependency
     )
 
-    def __init__(self, context_size=12, device='cuda:0', pretrained_ckpt=None, **kwargs):
+    def __init__(self, context_size=12, device='cuda:0', pretrained_ckpt=None,
+                 n_anchor=8, **kwargs):
         super().__init__()
         self.context_size = context_size
         self.device = device
+        # Number of leading "anchor" frames (LingBot-Map scale frames). These get
+        # bidirectional attention among themselves and fix the metric scale /
+        # coordinate frame for the rest of the episode. The old code hardcoded 1;
+        # streaming navigation uses 8 (paper default). For the parallel training
+        # forward this makes the first n_anchor frames mutually attended; for
+        # frame-by-frame streaming it marks which frames carry the scale token.
+        self.n_anchor = n_anchor
 
         # 1. LingBot AggregatorStream (DINOv2 patch_embed + alternating frame/GCA blocks)
         cfg = {**self.DEFAULTS, **kwargs}
@@ -95,6 +103,16 @@ class GeometryModel_LingBot(nn.Module):
         else:
             if pretrained_ckpt:
                 print(f"[lingbot-v2] WARNING: LINGBOT_CKPT not found at {pretrained_ckpt}")
+
+        # FREEZE BACKBONE: keep LingBot-Map's streaming-distilled features intact.
+        # The paper's stability anchor is global→streaming distillation; without it
+        # our Stage 1 MSE losses can't keep GCA stable, and v1 (full fine-tune)
+        # gave 0% SR on both pointgoal and startgoal. Heads + DA-S fusion + token
+        # compressors remain trainable.
+        for p in self.aggregator.parameters():
+            p.requires_grad = False
+        frozen = sum(p.numel() for p in self.aggregator.parameters())
+        print(f"[lingbot-v2] aggregator frozen: {frozen/1e6:.1f}M params")
 
         # 2. DepthAnythingV2-S for metric scale prior (kept from LoGoPlanner)
         model_configs = {'vits': {'encoder': 'vits', 'features': 64,
@@ -204,29 +222,63 @@ class GeometryModel_LingBot(nn.Module):
     def register_token(self):
         return self.aggregator.register_token
 
-    # ----- public forward ---------------------------------------------------
-    def forward(self, imgs, depths):
-        # AggregatorStream's KV cache is designed for streaming inference and
-        # persists state across forward calls. For training, every batch must
-        # start with a fresh cache or backward fails ("graph traversed twice").
+    # ----- KV cache lifecycle (Stage 3) ------------------------------------
+    def reset_kv_cache(self):
+        """Clear the streaming KV cache (call at every episode start / done)."""
         if hasattr(self.aggregator, 'clean_kv_cache'):
             self.aggregator.clean_kv_cache()
 
-        """Match the Pi3 GeometryModel signature.
+    def kv_cache_num_frames(self):
+        """Number of frames currently held in the aggregator's KV cache.
+
+        Reads whichever backend is active (FlashInfer manager or the SDPA dict).
+        Returns 0 when the cache is empty (fresh episode). Used to verify the
+        cache grows while streaming an episode and is bounded by the sliding
+        window, and drops to 0 after reset.
+        """
+        agg = self.aggregator
+        mgr = getattr(agg, 'kv_cache_manager', None)
+        if mgr is not None and getattr(mgr, 'num_frames', 0) > 0:
+            return int(mgr.num_frames)
+        kv = getattr(agg, 'kv_cache', None)
+        if kv and kv.get('k_0') is not None:
+            # SDPA cache k_0 is (B, heads, S_cached, ...) — dim 2 is cached frames.
+            return int(kv['k_0'].shape[2])
+        return 0
+
+    # ----- public forward ---------------------------------------------------
+    def forward(self, imgs, depths, reset_cache=True, assert_context=True):
+        """Match the Pi3 GeometryModel signature (+ Stage-3 streaming flags).
 
         Args:
             imgs:   (B, T, H, W, 3) RGB uint8 in [0,1] or float; will be cast.
             depths: (B, T, H, W, 1) depth (metric).
+            reset_cache: when True (default → training / full-window inference),
+                the KV cache is cleared first so every call is independent and
+                backward does not traverse a reused graph. Set False to STREAM:
+                the cache persists across calls so frame t attends to frames
+                <t of the same episode. Reset explicitly at episode boundaries
+                via ``reset_kv_cache()`` or by passing reset_cache=True on the
+                first frame.
+            assert_context: enforce T == context_size. Disable for streaming,
+                where T is typically 1 (one new frame per call).
 
         Returns:
             ([hidden, state_token, scene_token],
              [camera_poses, local_points, world_points])
         """
+        # AggregatorStream's KV cache persists across forward calls. Training and
+        # full-window inference need a fresh cache each call (else backward fails
+        # with "graph traversed twice"); streaming deliberately keeps it.
+        if reset_cache:
+            self.reset_kv_cache()
+
         imgs   = torch.as_tensor(imgs,   dtype=torch.float32, device=self.device)
         depths = torch.as_tensor(depths, dtype=torch.float32, device=self.device)
         B, T, H, W, _ = imgs.shape
-        assert T == self.context_size, \
-            f"context_size mismatch: got {T}, expected {self.context_size}"
+        if assert_context:
+            assert T == self.context_size, \
+                f"context_size mismatch: got {T}, expected {self.context_size}"
 
         # (B,T,H,W,3) -> (B,T,3,H,W) -> (B*T,3,H,W)
         imgs_t = imgs.permute(0, 1, 4, 2, 3).contiguous()
@@ -256,7 +308,7 @@ class GeometryModel_LingBot(nn.Module):
 
         # (4) Prepend LingBot special tokens (camera + register + scale)
         special_tokens = self.aggregator._prepare_special_tokens(
-            B, T, T, C, num_frame_for_scale=1,
+            B, T, T, C, num_frame_for_scale=self.n_anchor,
         )  # (B*T, num_special, 1024)
         tokens = torch.cat([special_tokens, fused], dim=1)
         # tokens: (B*T, P_total, 1024)
@@ -277,7 +329,7 @@ class GeometryModel_LingBot(nn.Module):
                 elif attn_type == 'global':
                     tokens, global_idx, global_inter = self.aggregator._process_global_attention(
                         tokens, B, T, T, P_total, C, global_idx,
-                        pos=pos, num_frame_for_scale=1,
+                        pos=pos, num_frame_for_scale=self.n_anchor,
                         sliding_window_size=None, num_frame_per_block=1,
                         image_height=H, image_width=W,
                     )
@@ -306,3 +358,65 @@ class GeometryModel_LingBot(nn.Module):
 
         return ([tokens, state_token, scene_token],
                 [camera_poses, local_points, world_points])
+
+    # ----- Streaming window encode (memory-bounded training/eval) -----------
+    @torch.no_grad()
+    def encode_window_streaming(self, imgs, depths):
+        """Stream an N-frame window through the persistent KV cache and return
+        per-frame tokens — same outputs as :meth:`forward` but with attention
+        memory bounded by the sliding window instead of the parallel O(N^2)
+        global attention. Frozen-backbone (no_grad) only.
+
+        Args:
+            imgs:   (B, N, H, W, 3), depths: (B, N, H, W, 1). Frames in order.
+        Returns:
+            ([None, state_token, scene_token], [camera_poses, local_points, world_points])
+            with state/scene (B, N, 384) and geometry preds (B, N, ...).
+        """
+        imgs = torch.as_tensor(imgs, dtype=torch.float32, device=self.device)
+        depths = torch.as_tensor(depths, dtype=torch.float32, device=self.device)
+        B, N = imgs.shape[:2]
+        self.reset_kv_cache()
+        states, scenes, cams, locs, wlds = [], [], [], [], []
+        for t in range(N):
+            (_, st, sc), (cp, lp, wp) = self.forward(
+                imgs[:, t:t + 1], depths[:, t:t + 1],
+                reset_cache=(t == 0), assert_context=False,
+            )
+            states.append(st); scenes.append(sc)
+            cams.append(cp); locs.append(lp); wlds.append(wp)
+        state_token = torch.cat(states, dim=1)            # (B, N, 384)
+        scene_token = torch.cat(scenes, dim=1)            # (B, N, 384)
+        camera_poses = torch.cat(cams, dim=1)             # (B, N, 5)
+        local_points = torch.cat(locs, dim=1)             # (B, N, H, W, 3)
+        world_points = torch.cat(wlds, dim=1)
+        return ([None, state_token, scene_token],
+                [camera_poses, local_points, world_points])
+
+    # ----- Stage 3: single-frame streaming step ----------------------------
+    @torch.no_grad()
+    def step_streaming(self, img, depth, episode_start=False):
+        """Process ONE new frame with the persistent KV cache (inference).
+
+        Reuses LingBot's existing causal KV cache (no attention is re-implemented):
+        frame t attends to the cached K/V of frames <t in the same episode. The
+        cache is bounded by ``kv_cache_sliding_window`` so memory does not grow
+        without limit over a long navigation episode.
+
+        Args:
+            img:   (B, H, W, 3) or (B, 1, H, W, 3) current RGB frame.
+            depth: (B, H, W, 1) or (B, 1, H, W, 1) current depth frame.
+            episode_start: when True, the KV cache is cleared first so this frame
+                begins a new episode (no history leaks across episodes).
+
+        Returns:
+            (state_token, scene_token) each (B, 1, 384) for the current frame.
+        """
+        if img.dim() == 4:
+            img = img.unsqueeze(1)        # (B, 1, H, W, 3)
+        if depth.dim() == 4:
+            depth = depth.unsqueeze(1)    # (B, 1, H, W, 1)
+        (_, state_token, scene_token), _ = self.forward(
+            img, depth, reset_cache=bool(episode_start), assert_context=False,
+        )
+        return state_token, scene_token

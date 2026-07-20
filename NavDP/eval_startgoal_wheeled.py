@@ -53,13 +53,43 @@ from utils_tasks.client_utils import navigator_reset,pointgoal_step
 from utils_tasks.visualization_utils import VisualizationManager
 from utils_tasks.tracking_utils import MPC_Controller
 
-planning_input = PlanningInput() 
+planning_input = PlanningInput()
 planning_output = PlanningOutput()
 input_lock = threading.Lock()
 output_lock = threading.Lock()
 stop_event = threading.Event()
 vis_manager = [VisualizationManager(history_size=5) for i in range(args_cli.num_envs)]
 mpc = None
+
+# ============================================================
+# Professor MVP: optionally replace IsaacSim GT pose with LingBot pose
+# Env vars:
+#   EVAL_USE_LINGBOT_POSE=1            enable replacement
+#   EVAL_LINGBOT_CKPT=<path>           LingBot ckpt (default: /home/nyuair/data-001/lingbot-map-ckpt/lingbot-map.pt)
+#   EVAL_LINGBOT_WINDOW=32             sliding window size
+# Logs LingBot vs sim pose per step to enable offline drift analysis.
+# ============================================================
+USE_LINGBOT_POSE = os.environ.get('EVAL_USE_LINGBOT_POSE', '0') == '1'
+USE_PGO          = os.environ.get('EVAL_USE_PGO', '0') == '1'
+LINGBOT_POSE_ESTIMATOR = None
+PGO_CORRECTOR    = None
+SIM_TO_LINGBOT_OFFSET = None  # 4x4 rigid transform mapping LingBot frame -> sim frame
+SIM_LINGBOT_POSE_LOG = []     # list of (step, sim_pose_4x4, lingbot_pose_4x4_in_sim_frame)
+LINGBOT_STEP = 0
+if USE_LINGBOT_POSE:
+    print('[professor] EVAL_USE_LINGBOT_POSE=1 -- loading LingBot estimator')
+    from lingbot_pose_estimator import LingBotPoseEstimator, PGOCorrector
+    LINGBOT_POSE_ESTIMATOR = LingBotPoseEstimator(
+        ckpt=os.environ.get('EVAL_LINGBOT_CKPT', '/home/nyuair/data-001/lingbot-map-ckpt/lingbot-map.pt'),
+        window_size=int(os.environ.get('EVAL_LINGBOT_WINDOW', '32')),
+    )
+    if USE_PGO:
+        print('[professor] EVAL_USE_PGO=1 -- loop closure + snap correction enabled')
+        PGO_CORRECTOR = PGOCorrector(
+            sim_cosine_threshold=float(os.environ.get('EVAL_PGO_COSINE', '0.992')),
+            min_drift_meters=float(os.environ.get('EVAL_PGO_MIN_DRIFT', '0.3')),
+            min_frames_gap=int(os.environ.get('EVAL_PGO_MIN_GAP', '25')),
+        )
 
 def planning_thread(env, camera_intrinsic):
     global mpc
@@ -194,6 +224,7 @@ sub_pointgoal_pd = np.zeros((args_cli.num_envs,3))
 while simulation_app.is_running():
     with torch.inference_mode():
         goals = infos['observations']['goal_pose'].cpu().numpy()[:,0:2]
+        goals_gt = goals.copy()   # preserve sim-GT goal_robot for honest success_flag
         images = infos['observations']['rgb'].cpu().numpy()[:,:,:,0:3]
         depths = infos['observations']['depth'].cpu().numpy()[:,:,:]
         # get all camera poses
@@ -201,7 +232,72 @@ while simulation_app.is_running():
         camera_rot_quat = env.unwrapped.scene.sensors['camera_sensor'].data.quat_w_world.cpu().numpy()
         camera_rot_quat = camera_rot_quat[:,[1, 2, 3, 0]]
         camera_rot = R.from_quat(camera_rot_quat).as_matrix()
-        
+
+        # === Professor MVP: override sim GT pose with LingBot pose ===
+        if USE_LINGBOT_POSE:
+            sim_pos_gt   = camera_pos.copy()   # (N,3) GT for logging only
+            sim_rot_gt   = camera_rot.copy()   # (N,3,3)
+            sim_goal_gt  = goals.copy()        # (N,2) robot-frame goal from sim using GT pose
+            # Build sim's 4x4 (env 0 only -- single-env eval)
+            sim_pose_4x4 = np.eye(4, dtype=np.float32)
+            sim_pose_4x4[:3, :3] = sim_rot_gt[0]
+            sim_pose_4x4[:3, 3]  = sim_pos_gt[0]
+            # Run LingBot on current RGB (env 0)
+            lingbot_pose_4x4 = LINGBOT_POSE_ESTIMATOR.estimate(images[0])  # camera->LingBot world
+            # At step 0, lock the rigid alignment LingBot world -> sim world so
+            # the FIRST LingBot pose maps to the FIRST sim pose. From then on,
+            # LingBot drift is exactly what the policy sees as "pose error".
+            if SIM_TO_LINGBOT_OFFSET is None:
+                # T_offset such that sim_pose_4x4 == T_offset @ lingbot_pose_4x4
+                SIM_TO_LINGBOT_OFFSET = sim_pose_4x4 @ np.linalg.inv(lingbot_pose_4x4)
+            aligned_pose = SIM_TO_LINGBOT_OFFSET @ lingbot_pose_4x4  # in sim-world coords
+            # === Loop closure + snap correction (Phase 2) ===
+            if USE_PGO and PGO_CORRECTOR is not None:
+                desc = LINGBOT_POSE_ESTIMATOR.get_descriptor()
+                triggered, snap_T = PGO_CORRECTOR.detect_and_correct(
+                    LINGBOT_STEP, aligned_pose.astype(np.float32), desc,
+                )
+                if triggered:
+                    # Apply the snap to alignment offset so subsequent frames inherit
+                    # the correction.  After this: aligned_pose_new = snap_T @ old aligned.
+                    SIM_TO_LINGBOT_OFFSET = snap_T @ SIM_TO_LINGBOT_OFFSET
+                    aligned_pose = snap_T @ aligned_pose
+                    print(f'[pgo] step={LINGBOT_STEP} CLOSURE triggered, snap dx='
+                          f'{snap_T[0,3]:+.3f} dy={snap_T[1,3]:+.3f}')
+                # Register the (possibly corrected) frame for future closure matches.
+                PGO_CORRECTOR.add(LINGBOT_STEP, aligned_pose.astype(np.float32), desc)
+            lb_pos = aligned_pose[:3, 3]
+            lb_rot = aligned_pose[:3, :3]
+            # Re-derive goal in LingBot's believed robot frame.
+            # goal_world (constant per episode) = sim_pose_4x4 @ [sim_goal_gt, 0, 1]
+            goal_robot_h = np.array([sim_goal_gt[0, 0], sim_goal_gt[0, 1], 0.0, 1.0], dtype=np.float32)
+            goal_world   = sim_pose_4x4 @ goal_robot_h
+            goal_lb_h    = np.linalg.inv(aligned_pose) @ goal_world
+            goals = goal_lb_h[None, :2].astype(np.float32)
+            # Override pose used downstream (planning + MPC world-frame transform).
+            camera_pos = lb_pos[None]
+            camera_rot = lb_rot[None]
+            # Log every 10 steps for drift trace.
+            if LINGBOT_STEP % 10 == 0:
+                pos_err = float(np.linalg.norm(sim_pos_gt[0] - lb_pos))
+                yaw_sim = float(np.arctan2(sim_rot_gt[0,1,0], sim_rot_gt[0,0,0]))
+                yaw_lb  = float(np.arctan2(lb_rot[1,0], lb_rot[0,0]))
+                yaw_err = float(((yaw_sim - yaw_lb + np.pi) % (2*np.pi)) - np.pi)
+                print(f'[lb] step={LINGBOT_STEP:4d} '
+                      f'sim=({sim_pos_gt[0,0]:+.2f},{sim_pos_gt[0,1]:+.2f}) '
+                      f'lb=({lb_pos[0]:+.2f},{lb_pos[1]:+.2f}) '
+                      f'|err|={pos_err:.3f}m yaw_err={yaw_err:+.3f}rad '
+                      f'goal_sim=({sim_goal_gt[0,0]:+.2f},{sim_goal_gt[0,1]:+.2f}) '
+                      f'goal_lb=({goals[0,0]:+.2f},{goals[0,1]:+.2f})')
+            SIM_LINGBOT_POSE_LOG.append({
+                'step': LINGBOT_STEP,
+                'sim_pos': sim_pos_gt[0].tolist(),
+                'lb_pos':  lb_pos.tolist(),
+                'sim_goal': sim_goal_gt[0].tolist(),
+                'lb_goal':  goals[0].tolist(),
+            })
+            LINGBOT_STEP += 1
+
         with input_lock:
             # Default (paper / HF release): freeze the goal at episode start so the
             # planner sees the same start-frame goal vector for the whole episode.
@@ -293,7 +389,17 @@ while simulation_app.is_running():
 
                 episode_num += 1
                 navigator_reset(env_id=i,port=args_cli.port)
-                success_flag = (np.sqrt(np.square(goals[i]).sum())<1.5).astype(np.float32)
+                # Use TRUE goal-in-robot-frame (sim GT) for success, NOT the
+                # LingBot-overridden value -- otherwise drift biases the metric.
+                _eval_goal = goals_gt[i] if USE_LINGBOT_POSE else goals[i]
+                success_flag = (np.sqrt(np.square(_eval_goal).sum())<1.5).astype(np.float32)
+                # Reset LingBot streaming state so next episode starts fresh.
+                if USE_LINGBOT_POSE and LINGBOT_POSE_ESTIMATOR is not None:
+                    LINGBOT_POSE_ESTIMATOR.reset()
+                    if PGO_CORRECTOR is not None:
+                        PGO_CORRECTOR.reset()
+                    SIM_TO_LINGBOT_OFFSET = None
+                    LINGBOT_STEP = 0
                 fps_writer[i].close()
                 evaluation_metrics.append({'success':success_flag,
                                         'spl': np.clip(euclidean[i] / trajectory_length[i],0,1) * success_flag,

@@ -29,9 +29,9 @@ import torch.nn.functional as F
 
 
 # --- Make lingbot-map repo importable ------------------------------------
-# On HPC the repo lives at /scratch/ay2710/LingBot/lingbot-map.
+# On HPC the repo lives at /home/nyuair/yuxuan/1 robot navigation/lingbot-map.
 # Override with env var LINGBOT_MAP_REPO if installed elsewhere.
-_DEFAULT_LINGBOT_MAP_REPO = '/scratch/ay2710/LingBot/lingbot-map'
+_DEFAULT_LINGBOT_MAP_REPO = '/home/nyuair/yuxuan/1 robot navigation/lingbot-map'
 _LINGBOT_MAP_REPO = os.environ.get('LINGBOT_MAP_REPO', _DEFAULT_LINGBOT_MAP_REPO)
 if _LINGBOT_MAP_REPO not in sys.path:
     sys.path.insert(0, _LINGBOT_MAP_REPO)
@@ -39,7 +39,7 @@ if _LINGBOT_MAP_REPO not in sys.path:
 from lingbot_map.models.gct_stream import GCTStream  # noqa: E402
 
 
-_DEFAULT_CKPT = '/scratch/ay2710/LingBot/lingbot-map-ckpt/lingbot-map.pt'
+_DEFAULT_CKPT = '/home/nyuair/data-001/lingbot-map-ckpt/lingbot-map.pt'
 
 
 class AttnPool(nn.Module):
@@ -224,8 +224,12 @@ class LingBotMapGeometryModel(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-    def _preprocess(self, imgs: torch.Tensor) -> torch.Tensor:
-        """(B, N, H, W, 3) in any range → (B, N, 3, S, S) in [0, 1]."""
+    def _preprocess(self, imgs) -> torch.Tensor:
+        """(B, N, H, W, 3) in any range → (B, N, 3, S, S) in [0, 1].
+        Accepts numpy or torch input (server passes numpy from HTTP)."""
+        if not isinstance(imgs, torch.Tensor):
+            imgs = torch.from_numpy(imgs)
+        imgs = imgs.float().to(next(self.backbone.parameters()).device)
         imgs = imgs.permute(0, 1, 4, 2, 3).contiguous()
         B, N, C, H, W = imgs.shape
 
@@ -274,6 +278,10 @@ class LingBotMapGeometryModel(nn.Module):
 
         state_token, scene_token = self.adapter(patch_tokens)    # (B, N, 384)
 
+        # v3: expose mean-pooled backbone features for FeatureCompressor retrieval.
+        # Detach since backbone is frozen; compressor grads only flow through itself.
+        self._last_frame_feats = patch_tokens.mean(dim=2).detach()  # (B, N, 2048)
+
         _, _, H_in, W_in, _ = imgs.shape
         device = state_token.device
         dtype = state_token.dtype
@@ -303,9 +311,28 @@ class LingBotMapGeometryModel(nn.Module):
         return [hidden, state_token, scene_token], [camera_poses, local_points, world_points]
 
 
+    def encode_single_frame(self, img: torch.Tensor) -> torch.Tensor:
+        """Encode one goal image → (B, 2048) mean-pooled backbone features.
+
+        Goal is NOT tiled to context_size; backbone sees it as a 1-frame sequence.
+        Called by the v3 retrieval path in logoplanner_policy.py forward.
+        Returns detached tensor (backbone is frozen).
+        """
+        if img.dim() == 4:          # (B, H, W, 3)
+            img = img.unsqueeze(1)  # → (B, 1, H, W, 3)
+        img_pp = self._preprocess(img)   # (B, 1, 3, S, S)
+        with torch.no_grad():
+            if hasattr(self.backbone, 'clean_kv_cache'):
+                self.backbone.clean_kv_cache()
+            agg_list, patch_start_idx = self.backbone._aggregate_features(img_pp)
+        last = agg_list[-1]                           # (B, 1, T, 2048)
+        patch_tokens = last[:, 0, patch_start_idx:]   # (B, P, 2048)
+        return patch_tokens.mean(dim=1)               # (B, 2048)
+
+
 if __name__ == '__main__':
     # Smoke test: instantiate, forward random data, print shapes.
-    # Run on HPC where /scratch/ay2710/LingBot/lingbot-map{,-ckpt} exist.
+    # Run on HPC where /home/nyuair/yuxuan/1 robot navigation/lingbot-map{,-ckpt} exist.
     torch.manual_seed(0)
     stage = int(os.environ.get('LOGO_STAGE', '2'))
     print(f'[smoke] stage = {stage}')

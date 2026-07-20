@@ -80,7 +80,7 @@ def planning_thread(env, camera_intrinsic):
             
             # Start timing planning
             planning_start = time.time()
-            trajectory_points_camera, all_trajectories_camera, all_values_camera = imagegoal_step(goal, image, depth,port=args_cli.port)
+            trajectory_points_camera, all_trajectories_camera, all_values_camera, *_ = imagegoal_step(goal, image, depth,port=args_cli.port)
         
             # Transform trajectory from camera frame to world frame
             batch_optimal_points_world = []

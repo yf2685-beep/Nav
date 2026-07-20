@@ -77,7 +77,7 @@ def planning_thread(env, camera_intrinsic):
             
             # Start timing planning
             planning_start = time.time()
-            trajectory_points_camera, all_trajectories_camera, all_values_camera = pointgoal_step(goal, image, depth,port=args_cli.port)
+            trajectory_points_camera, all_trajectories_camera, all_values_camera, *_ = pointgoal_step(goal, image, depth,port=args_cli.port)
             # Transform trajectory from camera frame to world frame
             batch_optimal_points_world = []
             for idx in range(trajectory_points_camera.shape[0]):

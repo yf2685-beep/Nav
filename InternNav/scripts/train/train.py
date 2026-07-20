@@ -35,6 +35,7 @@ from scripts.train.configs import (
     logoplanner_exp_cfg,
     logoplanner_stage1_exp_cfg,
     logoplanner_stage2_exp_cfg,
+    logoplanner_streaming_exp_cfg,
 )
 import sys
 from datetime import datetime
@@ -298,6 +299,19 @@ def main(config, model_class, model_config_class):
                 depth_max=config.il.depth_max,
                 depth_min=config.il.depth_min,
                 critic_goal_weight=getattr(config.il, 'critic_goal_weight', 0.0),
+                sequential=getattr(config.il, 'sequential', False),
+                seq_stride=getattr(config.il, 'seq_stride', 1),
+                multistop=getattr(config.il, 'multistop', False),
+                subgoal_dist=getattr(config.il, 'subgoal_dist', 1.5),
+                subgoal_turn_deg=getattr(config.il, 'subgoal_turn_deg', 30.0),
+                subgoal_arrival=getattr(config.il, 'subgoal_arrival', 0.5),
+                streaming=getattr(config.il, 'streaming', False),
+                # Env (LOGO_N_*) overrides config so a single set of vars controls
+                # BOTH the dataset window here and the policy (which reads env) —
+                # they must match. Falls back to config, then default.
+                n_anchor=int(os.environ.get('LOGO_N_ANCHOR', getattr(config.il, 'n_anchor', 8))),
+                n_traj=int(os.environ.get('LOGO_N_TRAJ', getattr(config.il, 'n_traj', 16))),
+                n_window=int(os.environ.get('LOGO_N_WINDOW', getattr(config.il, 'n_window', 64))),
             )
         else:
             if '3dgs' in config.il.lmdb_features_dir or '3dgs' in config.il.lmdb_features_dir:
@@ -353,6 +367,7 @@ def main(config, model_class, model_config_class):
             wandb_run_name = f'{config.name}_{_loss_weight_tag(config.il.loss)}'
         else:
             wandb_run_name = config.name
+        _ms_cfg = int(getattr(config.il, 'max_steps', -1) or -1)
         training_args = TrainingArguments(
             output_dir=config.output_dir,
             run_name=wandb_run_name,
@@ -370,9 +385,13 @@ def main(config, model_class, model_config_class):
             lr_scheduler_type='cosine',
             logging_steps=10.0,
             num_train_epochs=config.il.epochs,
-            max_steps=int(getattr(config.il, 'max_steps', -1) or -1),
-            save_strategy='epoch',# no
-            save_steps=config.il.save_interval_epochs,
+            max_steps=_ms_cfg,
+            # A max_steps cap stops mid-epoch (streaming sequential=True → 1 epoch
+            # ~750k steps), so 'epoch' save would never fire and no ckpt is written.
+            # Save by steps in that case (trainer.save_model writes the .ckpt); a
+            # final save after train() below guarantees the last-step ckpt.
+            save_strategy='steps' if _ms_cfg > 0 else 'epoch',
+            save_steps=(min(500, _ms_cfg) if _ms_cfg > 0 else config.il.save_interval_epochs),
             save_total_limit=8,
             report_to=config.il.report_to,
             seed=0,
@@ -396,6 +415,16 @@ def main(config, model_class, model_config_class):
         trainer.add_callback(ckpt_format_callback)
 
         trainer.train()
+        # Guarantee a final checkpoint even if save_strategy didn't fire on the
+        # last step (e.g. a max_steps mid-epoch stop). Writes
+        # <output_dir>/checkpoint-<step>logoplanner.ckpt (same format as periodic saves).
+        if int(os.getenv('LOCAL_RANK', '0')) in (0, -1):
+            try:
+                _final_dir = os.path.join(config.output_dir, f'checkpoint-{trainer.state.global_step}')
+                trainer.save_model(_final_dir)
+                print(f'[final-save] wrote {_final_dir}logoplanner.ckpt')
+            except Exception as e:
+                print(f'[final-save] failed: {e}')
         if train_logger:
             for handler in train_logger.handlers:
                 handler.flush()
@@ -435,6 +464,7 @@ if __name__ == '__main__':
         'logoplanner': [logoplanner_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
         'logoplanner_stage1': [logoplanner_stage1_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
         'logoplanner_stage2': [logoplanner_stage2_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
+        'logoplanner_streaming': [logoplanner_streaming_exp_cfg, LoGoPlannerNet, LoGoPlannerModelConfig],
     }
 
     if config.model_name not in supported_cfg:
