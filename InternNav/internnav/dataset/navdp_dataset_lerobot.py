@@ -6,7 +6,10 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-import open3d as o3d
+try:
+    import open3d as o3d  # only used by NavDP's point-cloud path; MemNav does not need it
+except Exception:
+    o3d = None
 import pandas as pd
 import torch
 from PIL import Image

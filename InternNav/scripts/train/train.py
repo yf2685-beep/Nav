@@ -325,8 +325,10 @@ def main(config, model_class, model_config_class):
             lr_scheduler_type='cosine',
             logging_steps=10.0,
             num_train_epochs=config.il.epochs,
-            save_strategy='epoch',# no
-            save_steps=config.il.save_interval_epochs,
+            # step-based saving when save_interval_steps is set (memnav: survive SLURM
+            # requeue by checkpointing often); else the old per-epoch behavior for other models.
+            save_strategy=('steps' if getattr(config.il, 'save_interval_steps', None) else 'epoch'),
+            save_steps=(getattr(config.il, 'save_interval_steps', None) or config.il.save_interval_epochs),
             save_total_limit=8,
             report_to=config.il.report_to,
             seed=0,
@@ -349,7 +351,21 @@ def main(config, model_class, model_config_class):
         ckpt_format_callback = CheckpointFormatCallback(run_name=run_name, exp_cfg_dir=config.log_dir)
         trainer.add_callback(ckpt_format_callback)
 
-        trainer.train()
+        # Resume from the newest checkpoint if one exists. SLURM preemption restarts this
+        # whole script from the top (job 140012 lost ~130 steps this way); with step-based
+        # saving above, resuming here makes requeue cost only the last <save_steps steps.
+        from transformers.trainer_utils import get_last_checkpoint
+        _last_ckpt = (get_last_checkpoint(training_args.output_dir)
+                      if os.path.isdir(training_args.output_dir) else None)
+        # get_last_checkpoint returns ANY checkpoint-N dir, including an empty/partial one
+        # left by a crashed run (job 140012 died resuming an empty checkpoint-1). Only
+        # resume a checkpoint that actually has the trainer state; otherwise start fresh.
+        if _last_ckpt and not os.path.isfile(os.path.join(_last_ckpt, 'trainer_state.json')):
+            print(f"[resume] {_last_ckpt} is incomplete (no trainer_state.json) -> fresh start")
+            _last_ckpt = None
+        if _last_ckpt:
+            print(f"[resume] found {_last_ckpt} -> resuming from it")
+        trainer.train(resume_from_checkpoint=_last_ckpt)
         if train_logger:
             for handler in train_logger.handlers:
                 handler.flush()

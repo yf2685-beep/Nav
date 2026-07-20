@@ -54,10 +54,17 @@ memnav_exp_cfg = ExpCfg(
         epochs=1000,
         batch_size=8,
         lr=1e-4,
-        num_workers=4,
+        # DataLoader workers ship window_images (32*3*518*518*4 = 103MB/sample,
+        # ~823MB/batch) through /dev/shm; 4 workers x prefetch overruns a 16G shm and
+        # the feeder thread dies -> the main process waits forever (job 140010 hung at
+        # step 13 this way). 0 = load in-process, no shm transfer at all.
+        num_workers=int(os.environ.get('MEMNAV_NUM_WORKERS', '4')),
         weight_decay=1e-4,
         warmup_ratio=0.05,
         save_interval_epochs=5,
+        # step-based checkpoints (~every 20 steps ≈ 1h) so a SLURM requeue resumes instead
+        # of restarting from step 0. Read by train.py to switch save_strategy to 'steps'.
+        save_interval_steps=int(os.environ.get('MEMNAV_SAVE_STEPS', '20')),
         save_filter_frozen_weights=True,
         load_from_ckpt=False,
         ckpt_to_load='',
