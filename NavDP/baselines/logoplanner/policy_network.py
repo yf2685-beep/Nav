@@ -8,12 +8,22 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from policy_backbone import *
 from geometry_model import GeometryModel
 
-# Method 2 (this branch): preserve LoGoPlanner's DA-S depth-prior fusion and
-# replace Pi3's bidirectional decoder with LingBot-Map's AggregatorStream
-# (frame attention + GCA). Enable via LOGO_BACKBONE=lingbot_v2.
-# Default ('pi3' or unset) keeps the original Pi3 path.
+# Backbone selector. Both phase-1 LingBot methods are kept side by side here; they are
+# alternative geometry backends chosen at runtime, never active together.
+#   LOGO_BACKBONE=pi3         (default) original Pi3 path, unchanged
+#   LOGO_BACKBONE=lingbot_map Method 1 — frozen LingBot-Map (GCTStream) + Adapter
+#   LOGO_BACKBONE=lingbot_v2  Method 2 — AggregatorStream (frame attention + GCA)
+#                             replacing Pi3's bidirectional decoder, DA-S depth-prior
+#                             fusion preserved
 _LOGO_BACKBONE = os.environ.get('LOGO_BACKBONE', 'pi3').lower()
-if _LOGO_BACKBONE == 'lingbot_v2':
+# Stage selector, Method 1 only:
+#   LOGO_STAGE=1 → build geometric heads on Adapter output, return real preds
+#                  (pair with w_pose/w_local/w_world > 0, w_diffusion/critic/subgoal = 0)
+#   LOGO_STAGE=2 (default) → no geometric heads, return dummy zeros (B 方案 / 论文 stage 2)
+_LOGO_STAGE = int(os.environ.get('LOGO_STAGE', '2'))
+if _LOGO_BACKBONE == 'lingbot_map':
+    from lingbot_map_geometry import LingBotMapGeometryModel
+elif _LOGO_BACKBONE == 'lingbot_v2':
     from geometry_model_lingbot import GeometryModel_LingBot
 
 
@@ -41,7 +51,14 @@ class LoGoPlanner_Policy(nn.Module):
         
         # input encoders
         self.rgbd_encoder = NavDP_RGBD_Backbone(image_size,token_dim,memory_size=memory_size,device=device)
-        if _LOGO_BACKBONE == 'lingbot_v2':
+        if _LOGO_BACKBONE == 'lingbot_map':
+            # Method 1: frozen LingBot-Map (GCTStream) + Adapter.
+            self.state_encoder = LingBotMapGeometryModel(
+                context_size=context_size,
+                device=device,
+                stage1_heads=(_LOGO_STAGE == 1),
+            )
+        elif _LOGO_BACKBONE == 'lingbot_v2':
             # Method 2: AggregatorStream + DA-S depth-prior fusion preserved.
             self.state_encoder = GeometryModel_LingBot(context_size=context_size, device=device)
         else:
