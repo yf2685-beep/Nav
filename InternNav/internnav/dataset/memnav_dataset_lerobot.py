@@ -77,11 +77,51 @@ import torch
 
 from internnav.dataset.navdp_dataset_lerobot import NavDP_Base_Datset
 
-# Habitat (Y-up) -> dataset "data" world frame (Z-up): data = MW @ habitat. Exact transform
-# used when the parquet/gen_meta.json were written (MemNavData/generate_twoleg.py:save_traj:
-# `Td[:3,:3] = M_W @ Tw[:3,:3]`) — a plain left-multiply (not a conjugation) because MW changes
-# the WORLD basis while the camera/local frame is untouched.
+# Habitat (Y-up) -> dataset "data" world frame (Z-up): data = MW @ habitat.
+#
+# A change of world basis acts on a ROTATION as a similarity transform, not a plain
+# left-multiply. A camera-to-world R maps local -> world, so re-expressing the world in a
+# new basis needs MW on the left AND MW.T on the right: `MW @ R @ MW.T`. Only a POSITION
+# takes the bare `MW @ t`. Concretely, the right-multiply is what re-orders which local
+# axis sits at which index: Habitat's camera axes are (right, up, forward) in its Y-up
+# convention, and the Z-up convention this dataset uses expects (right, forward, up).
+#
+# The writer (MemNavData/generate_twoleg.py:save_traj) stores only the left-multiply,
+# `Td[:3,:3] = M_W @ Tw[:3,:3]`, so the local axis ORDER stays in Habitat's ordering and
+# column 1 of every stored rotation is the world VERTICAL axis instead of forward. The
+# damage is silent and total: `relative_pose` resolves displacement onto those columns and
+# permutes [c1, -c0, c2], then `xyz_to_xyt` keeps only channels (0,1) -- so the action
+# label becomes [vertical, lateral, theta] and the FORWARD component is discarded.
+#
+# Measured on the real MP3D parquets (12 scenes): label ch0 std = 0.000000 while the robots
+# travelled 6-14 m; max |ch0| ever seen = 0.19999993 m, exactly the navmesh agent_max_climb,
+# i.e. pure stair jitter. Theta was collateral damage too (nonzero in only 4.5% of rows, and
+# then only as +-4pi artifacts, because collinear points on a single surviving axis have no
+# meaningful bearing). Consequence: navigation SR is pinned at ~0 and no eval-side knob
+# (MEMNAV_SWAP_XY / FWD_SIGN / LAT_SIGN) can recover a component that was never written.
+# It hid for months because a constant-zero channel is trivial to fit, so the action loss
+# fell smoothly (0.33 -> 0.088) and looked like healthy convergence.
+#
+# The parquets are NOT regenerated: they store the full 4x4, so the pose information was
+# mis-projected rather than lost, and `_fix_stored_rotation` recovers it at load time.
 _MW_HAB2DATA = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+
+# Set MEMNAV_LEGACY_ROT_FRAME=1 to reproduce the old (broken) labels for A/B comparison.
+_LEGACY_ROT_FRAME = os.environ.get("MEMNAV_LEGACY_ROT_FRAME", "0") == "1"
+
+
+def _fix_stored_rotation(R):
+    """Undo the writer's missing conjugation on rotations read back from the parquet.
+
+    Stored:  R_stored = MW @ R_habitat            (plain left-multiply -- wrong)
+    Wanted:  R_data   = MW @ R_habitat @ MW.T     (conjugation)
+    Hence:   R_data   = R_stored @ MW.T
+
+    Accepts [...,3,3] and returns the same shape. No-op under MEMNAV_LEGACY_ROT_FRAME=1.
+    """
+    if _LEGACY_ROT_FRAME:
+        return R
+    return R @ _MW_HAB2DATA.T
 
 
 def _yaw_habitat_to_R_data(yaw):
@@ -90,10 +130,15 @@ def _yaw_habitat_to_R_data(yaw):
     gen_meta's frame_convention note, unlike positions which are already data-frame) — it's
     cam_to_world_hab's own construction (generate_twoleg.py): a pure rotation about
     habitat's Y (up) axis, R_y(yaw) = [[cos,0,sin],[0,1,0],[-sin,0,cos]], no pitch/roll
-    (camera always level). Converted to data frame via the same MW used for positions."""
+    (camera always level).
+
+    Converted to data frame by CONJUGATION, matching `_fix_stored_rotation` — these two must
+    agree or `goal_rel_rotation = R_cur.T @ R_goal` silently mixes two different frames."""
     c, s = np.cos(yaw), np.sin(yaw)
     R_hab = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
-    return _MW_HAB2DATA @ R_hab
+    if _LEGACY_ROT_FRAME:
+        return _MW_HAB2DATA @ R_hab
+    return _MW_HAB2DATA @ R_hab @ _MW_HAB2DATA.T
 
 
 class MemNav_Dataset(NavDP_Base_Datset):
@@ -362,6 +407,26 @@ class MemNav_Dataset(NavDP_Base_Datset):
         return self._load_and_preprocess(
             [path], mode=self.preprocess_mode, image_size=self.image_size, patch_size=self.patch_size
         )[0]
+
+    # ------------------------------------------------------------------ #
+    # rotation-frame correction on load (see _fix_stored_rotation)
+    # ------------------------------------------------------------------ #
+    def process_data_parquet(self, index):
+        """Base-class loader + the rotation-frame correction.
+
+        Overridden HERE rather than in `NavDP_Base_Datset.process_data_parquet` on purpose:
+        that base method is shared with the navdp and logoplanner datasets, whose data was
+        written by different generators. Correcting it there would silently change their
+        labels too. Only memnav's MP3D data comes from MemNavData/generate_twoleg.py.
+
+        `base_extrinsic` is the fixed camera mount (identity in this dataset) and is left
+        alone; only the per-frame camera-to-world trajectory is corrected.
+        """
+        camera_intrinsic, base_extrinsic, camera_trajectory, trajectory_length = (
+            super().process_data_parquet(index))
+        camera_trajectory = camera_trajectory.copy()
+        camera_trajectory[:, :3, :3] = _fix_stored_rotation(camera_trajectory[:, :3, :3])
+        return camera_intrinsic, base_extrinsic, camera_trajectory, trajectory_length
 
     # ------------------------------------------------------------------ #
     # action label + goal-relative pose (no critic — collision is geometric at eval)
