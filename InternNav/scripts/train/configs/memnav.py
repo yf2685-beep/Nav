@@ -33,6 +33,12 @@ _MAX_LEGS = int(os.environ.get('MEMNAV_MAX_LEGS') or 0) or None
 # recent progress (epoch-based saves never fired — runs die mid-epoch-0). Non-None here
 # switches train.py to save_strategy='steps' for memnav (other models stay on 'epoch').
 _SAVE_STEPS = int(os.environ.get('MEMNAV_SAVE_STEPS', '100'))
+# RevisitMerge.aux_pose_head calibration: 'empirical' (frozen at the fitted axis+scale
+# constant) or 'trainable' (same init, but its own weight/bias adapt via w_aux_pose*aux_loss
+# -- see RevisitMerge's docstring for why gradient reaches this head even though the
+# upstream camera poses are frozen). Both remain a per-video-scale-ambiguity-limited
+# diagnostic, not a precision signal -- see the ground-anchored-scale TODO there.
+_AUX_POSE_CALIBRATION = os.environ.get('MEMNAV_AUX_POSE_CALIBRATION', 'empirical')
 
 memnav_exp_cfg = ExpCfg(
     name='memnav_train',
@@ -92,6 +98,7 @@ memnav_exp_cfg = ExpCfg(
         # window_size — the model's own KV eviction trims back to that during the warm
         # recompute, which measured the same accuracy as never evicting at all.
         goal_warm=64,
+        aux_pose_calibration=_AUX_POSE_CALIBRATION,
         # policy / diffusion
         predict_size=24,
         temporal_depth=8,

@@ -354,8 +354,13 @@ def save_traj(out_dir, rgbs, depths, poses_hab, meta, goal_rgbs):
         Image.fromarray(g).save(os.path.join(out_dir, f"goal_{k}.jpg"), quality=95)
     if goal_rgbs:
         Image.fromarray(goal_rgbs[0]).save(os.path.join(out_dir, "goal_image.jpg"), quality=95)
-    # poses -> stored Z-up camera-to-world; extrinsic = identity mount (we bake full pose)
+    # Poses are stored as Z-up camera-to-world. NavDP expects action_R =
+    # base_R @ camera_mount_R and removes the mount before making planar labels.
+    # At zero Habitat yaw, action_R is M_W, so the corresponding mount is M_W,
+    # not identity. Its translation is the camera height in the Z-up data frame.
     ext = np.eye(4)
+    ext[:3, :3] = M_W
+    ext[:3, 3] = M_W @ np.array([0.0, float(meta.get("camera_height_m", 0.5)), 0.0])
     rows = []
     for i, Tw in enumerate(poses_hab):
         Td = np.eye(4); Td[:3, :3] = M_W @ Tw[:3, :3]; Td[:3, 3] = M_W @ Tw[:3, 3]
@@ -659,6 +664,7 @@ def make_episode(sim, rng, args, ep_idx, esdf_cache):
                     # LingBot streaming: valid match range = [anchor_margin, step); loader masks [0,anchor_margin)
                     # from retrieval positives (goal_append can't reconstruct a match below num_scale+window-1).
                     window=args.window, num_scale=args.num_scale, anchor_margin=args.anchor_margin,
+                    camera_height_m=float(args.cam_h),
                     frame_convention="positions+parquet in data(Zup,M_W); yaw_habitat in render frame")
         return rgbs, depths, poses, meta, goal_rgbs
     return None

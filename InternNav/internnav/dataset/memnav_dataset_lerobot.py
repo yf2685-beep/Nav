@@ -75,6 +75,7 @@ import os
 import numpy as np
 import torch
 
+from internnav.dataset.memnav_pose_conventions import resolve_memnav_base_extrinsic, wrap_radians
 from internnav.dataset.navdp_dataset_lerobot import NavDP_Base_Datset
 
 # Habitat (Y-up) -> dataset "data" world frame (Z-up): data = MW @ habitat. Exact transform
@@ -287,6 +288,7 @@ class MemNav_Dataset(NavDP_Base_Datset):
         pos_hi = float(meta.get('covis_pos_hi', self.covis_pos_hi))
         pos_lo = float(meta.get('covis_pos_lo', self.covis_pos_lo))
         amargin = int(meta.get('anchor_margin', self.anchor_margin_default))
+        frame_convention = meta.get('frame_convention', '')
         slack = self.goal_slack
         t = self.exclude_recent
         out = []
@@ -337,6 +339,8 @@ class MemNav_Dataset(NavDP_Base_Datset):
                 out.append(dict(has_covis=False, goal_j=-1, leg_start=0, goal_step=goal_step,
                                 k_lo=int(k_lo), k_hi=int(k_hi), goal_img_path=_rgb(a_frame),
                                 T_A=a_frame, amargin=amargin))
+        for sample in out:
+            sample['frame_convention'] = frame_convention
         return out
 
     def __len__(self):
@@ -378,8 +382,18 @@ class MemNav_Dataset(NavDP_Base_Datset):
         pred_xyt = target_xyt[action_indexes]                       # [predict_size+1, 3]
         # aux GT = the TRUE goal (full-path endpoint), not pred_xyt[-1] which is the
         # action-horizon-truncated waypoint (~96 steps) for long revisit segments.
-        goal_rel_pose = target_xyt[-1].astype(np.float32).copy()    # goal pose rel to current
-        pred_actions = (pred_xyt[1:] - pred_xyt[:-1]) * 4.0         # [predict_size, 3] deltas
+        goal_rel_pose = target_xyt[-1].astype(np.float32).copy()
+        # xyz_to_xyt stores the position at the *start* of each segment, so its
+        # final row is the penultimate frame. Use the actual endpoint position
+        # while retaining the final path-tangent heading from xyz_to_xyt.
+        goal_rel_pose[:2] = target_local_points[-1, :2]
+        goal_rel_pose[2] = wrap_radians(goal_rel_pose[2])
+        pred_actions = pred_xyt[1:] - pred_xyt[:-1]                  # [predict_size, 3] deltas
+        # Heading is circular. Direct subtraction creates a fake +/-2pi jump whenever
+        # adjacent headings straddle atan2's branch cut; after NavDP's x4 scaling that
+        # becomes an outlier near 8pi. Wrap the delta (in physical radians) before scaling.
+        pred_actions[:, 2] = wrap_radians(pred_actions[:, 2])
+        pred_actions *= 4.0
         return pred_actions, goal_rel_pose
 
     # ------------------------------------------------------------------ #
@@ -427,6 +441,7 @@ class MemNav_Dataset(NavDP_Base_Datset):
             extrinsics,            # [T_pq, 4, 4] camera-to-world per frame
             traj_len_parquet,
         ) = self.process_data_parquet(ti)
+        base_extrinsic = resolve_memnav_base_extrinsic(base_extrinsic, s.get('frame_convention'))
 
         dino_cls = self._load_dino_cls(ti)                 # [T_f, 1024]
         T = int(min(traj_len_parquet, dino_cls.shape[0]))

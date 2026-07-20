@@ -143,46 +143,64 @@ class RevisitMerge(nn.Module):
         heading is the natural approach heading"; goal_yaw = anchor's OWN heading +
         random jitter) — so there is no θ signal in (cur_pose, goal_pose) to extract even
         in principle.
-        aux_pose_head is a FROZEN (non-trainable) Linear(3,2): cur_pose/goal_pose come
-        from the frozen camera head under no_grad, so t_rel carries no gradient anyway —
-        a learned correction here can only ever converge to the same fixed calibration a
-        precomputed one would, since t_rel alone carries no per-sample signal a global
-        affine map could improve on (LingBot's scale ambiguity/axis convention is a
-        global property, not something (cur_pose,goal_pose) alone lets you condition
-        per-sample). Kept as a logged diagnostic (not part of the optimized loss — see
-        MemNavTrainer), not deleted, so that IF the frozen branch is later LoRA-tuned
-        (making cur_pose/goal_pose differentiable), unfreezing this one module turns it
-        back into a real trainable calibration head with zero other code changes.
-        Weights are set to the empirically-fit R_conv + scale (see
-        scripts/diag_lingbot_pose_accuracy.py's end-to-end validation: real t_rel vs
-        real GT goal position, ~3° direction error, ~0.52-0.56 magnitude ratio across
-        two independent episodes — consistent with the ~0.5x scale-ambiguity finding in
-        the lingbot-pose-calibration investigation).
+        aux_pose_head's calibration mode is `aux_pose_calibration` ('empirical' | 'trainable'):
+        cur_pose/goal_pose come from the frozen camera head under no_grad, so t_rel itself
+        carries no gradient either way — but aux_pose_head is a plain nn.Linear with its
+        OWN weight/bias, which DOES receive a local gradient from w_aux*aux_loss
+        (MemNavTrainer.compute_loss) regardless of the no_grad upstream of it; 'trainable'
+        just stops blocking that local gradient. Per-video LingBot scale ambiguity (see
+        below) means neither mode can be exact per-sample, only a pooled compromise.
+        'empirical': frozen at the fitted constant below (pure diagnostic, matches the
+        original design). 'trainable': same init, but allowed to adapt its own weight/bias
+        during training — since t_rel/R_rel carry no gradient, this can only re-fit the
+        SAME kind of global affine map a precomputed constant would, so it is not expected
+        to beat 'empirical' by much; it exists so both can be compared directly.
+
+        Axis convention + scale were refit 2026-07-20 against the corrected GT (axis/mount,
+        angle-wrap, and goal-endpoint fixes — see MEMNAV_AXIS_AND_ANGLE_WRAP.md) using an
+        origin-anchored 2D Procrustes fit (rotation + scale, no reflection) of real t_rel
+        vs real goal_rel_pose, over 14 clean mp3d_2leg validate_gated samples (3-leg
+        excluded: noisier, deeper revisits). The fit converged to a rotation within ~5 deg
+        of the clean axis-permutation `[t_rel_z, -t_rel_x]` already used independently by
+        revisit_pose.py's GaugeInvariantRevisitPose and predicted from first principles —
+        NOT the old _R_CONV, which was fit against pre-fix GT contaminated by the identity
+        camera_extrinsic bug (axis fix item 1) and is stale.
+        Scale is NOT shared across videos: the same 14 samples' per-sample scale ratio
+        (|goal_rel_pose| / |t_rel_xz|) ranges 0.96-5.51x (std/mean=39%, i.e. LingBot's
+        monocular scale is a per-trajectory quantity, not a global constant — expected,
+        since t_rel alone gives the head no way to know which video it's in). _SCALE below
+        is the pooled least-squares compromise across those samples, not a precise
+        per-trajectory calibration.
+        TODO(ground-anchored-scale): calibrate scale PER TRAJECTORY from LingBot's own
+        estimated camera-to-ground distance vs the known camera mount height
+        (camera_height_m), instead of one pooled global constant. See VGP-Nav
+        (arXiv:2606.09268) sec III-E "Ground-Anchored Scale Recovery": ground height =
+        the dominant peak in a height histogram of the reconstructed point cloud along
+        the gravity axis; scale = known_height / estimated_height, computed once per
+        trajectory/session and held fixed while the robot stays on the same floor. Needs
+        (1) LingBot's own gravity/up-axis convention confirmed, (2) the underlying
+        (currently feature-only-truncated) depth head re-enabled to get real depth values,
+        (3) new per-trajectory persistent state threaded through dataset/policy (today's
+        RevisitMerge is stateless per (cur_pose, goal_pose) pair). Not started.
     """
 
-    # Empirically-fit local-frame axis convention (LingBot pose9 -> dataset's local
-    # (x,y,z)): swap x/y with sign flips, negate z. Validated two ways — (1) fitting a
-    # rotation between consecutive-frame LOCAL displacement directions (LingBot vs GT),
-    # clean (~3-5 deg residual) whenever LingBot's own pose estimate is accurate, and
-    # degrading in lockstep with measured LingBot VO drift (not a different convention
-    # per trajectory); (2) applying it to REAL t_rel from REAL (cur_pose, goal_pose)
-    # pairs and comparing directly to real GT goal_rel_pose (x,y): ~3 deg direction
-    # error. Scale: mean(0.523, 0.559) magnitude ratio across those two episodes -> the
-    # correction is 1/0.541.
-    _R_CONV = ((0.0, -1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, -1.0))
-    _SCALE = 1.0 / 0.541
+    # See docstring above for how these were derived and their (known, per-video) limits.
+    _R_CONV = ((0.0, 0.0, 1.0), (-1.0, 0.0, 0.0), (0.0, -1.0, 0.0))
+    _SCALE = 2.564
 
-    def __init__(self, dim=384, n_out=4):
+    def __init__(self, dim=384, n_out=4, aux_pose_calibration='empirical'):
         super().__init__()
         self.revisit_head = nn.Linear(12, n_out * dim)       # [t_rel(3), R_rel.flatten(9)] -> n_out tokens
         self.n_out, self.dim = n_out, dim
-        # frozen, pre-calibrated (x,y) readout — see class docstring
+        assert aux_pose_calibration in ('empirical', 'trainable'), aux_pose_calibration
+        self.aux_pose_calibration = aux_pose_calibration
+        # calibrated (x,y) readout, frozen or trainable per aux_pose_calibration — see class docstring
         self.aux_pose_head = nn.Linear(3, 2)
         R_conv = torch.tensor(self._R_CONV)
         with torch.no_grad():
             self.aux_pose_head.weight.copy_(self._SCALE * R_conv[:2])
             self.aux_pose_head.bias.zero_()
-        self.aux_pose_head.requires_grad_(False)
+        self.aux_pose_head.requires_grad_(aux_pose_calibration == 'trainable')
 
     @staticmethod
     def _split_pose9(pose9):
@@ -216,7 +234,7 @@ class RevisitMerge(nn.Module):
     def forward(self, cur_pose, goal_pose):
         """cur_pose, goal_pose: [B, 9] absolute camera poses (map frame)."""
         t_rel, R_rel = self._relative_pose(cur_pose, goal_pose)          # [B,3], [B,3,3]
-        aux_pose = self.aux_pose_head(t_rel)                             # [B,2]  (x,y) only — frozen
+        aux_pose = self.aux_pose_head(t_rel)                             # [B,2]  (x,y) only
         rel_feat = torch.cat([t_rel, R_rel.flatten(-2)], dim=-1)         # [B,12]
         revisit_readout = self.revisit_head(rel_feat).view(-1, self.n_out, self.dim)
         # R_rel returned too — not for any loss (no head/calibration needed for it, it's a
@@ -232,7 +250,8 @@ class RevisitMerge(nn.Module):
 class MemNavNet(nn.Module):
     def __init__(self, lingbot_kwargs=None, dino_dim=1024, lingbot_dim=2048, depth_feat_dim=256,
                  token_dim=384, heads=8, m_rgbd=4, m_depth=4, m_revisit=4, m_novel=4,
-                 predict_size=24, temporal_depth=8, num_diffusion_iters=10, goal_warm=64, device="cuda"):
+                 predict_size=24, temporal_depth=8, num_diffusion_iters=10, goal_warm=64,
+                 aux_pose_calibration='empirical', device="cuda"):
         super().__init__()
         self.lingbot = LingBotStream(device=device, **(lingbot_kwargs or {}))
         self.window = self.lingbot.window
@@ -257,7 +276,7 @@ class MemNavNet(nn.Module):
         self.compress_rgbd = TokenCompressor(token_dim, heads, m_rgbd)
         self.compress_depth = TokenCompressor(token_dim, heads, m_depth)
         # revisit: analytic relative pose from current + goal absolute camera poses (+ aux pose head)
-        self.revisit_merge = RevisitMerge(token_dim, m_revisit)
+        self.revisit_merge = RevisitMerge(token_dim, m_revisit, aux_pose_calibration=aux_pose_calibration)
 
         # --- NavDP DDPM decoder (no critic) ---
         # memory layout: [ time(1) | current_state(n_cs) | revisit(n_rev) | novel(n_nov) ]
@@ -549,6 +568,7 @@ class MemNavPolicy(PreTrainedModel):
             token_dim=il['token_dim'], heads=il['heads'], predict_size=il['predict_size'],
             temporal_depth=il['temporal_depth'], num_diffusion_iters=il.get('num_diffusion_iters', 10),
             goal_warm=il.get('goal_warm', 64),
+            aux_pose_calibration=il.get('aux_pose_calibration', 'empirical'),
             lingbot_kwargs=lingbot_kwargs or None, device=str(self._device),
         )
 
