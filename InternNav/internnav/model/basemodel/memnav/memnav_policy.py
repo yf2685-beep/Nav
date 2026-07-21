@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from transformers import PretrainedConfig, PreTrainedModel
 
-from internnav.model.basemodel.memnav.lingbot_stream import LingBotStream
+from internnav.model.basemodel.memnav.lingbot_stream import LingBotStream, ground_scale_from_h_est
 from internnav.model.encoder.navdp_backbone import (
     LearnablePositionalEncoding,
     NavDP_ImageGoal_Backbone,
@@ -171,34 +171,42 @@ class RevisitMerge(nn.Module):
         since t_rel alone gives the head no way to know which video it's in). _SCALE below
         is the pooled least-squares compromise across those samples, not a precise
         per-trajectory calibration.
-        TODO(ground-anchored-scale): calibrate scale PER TRAJECTORY from LingBot's own
-        estimated camera-to-ground distance vs the known camera mount height
-        (camera_height_m), instead of one pooled global constant. See VGP-Nav
-        (arXiv:2606.09268) sec III-E "Ground-Anchored Scale Recovery": ground height =
-        the dominant peak in a height histogram of the reconstructed point cloud along
-        the gravity axis; scale = known_height / estimated_height, computed once per
-        trajectory/session and held fixed while the robot stays on the same floor. Needs
-        (1) LingBot's own gravity/up-axis convention confirmed, (2) the underlying
-        (currently feature-only-truncated) depth head re-enabled to get real depth values,
-        (3) new per-trajectory persistent state threaded through dataset/policy (today's
-        RevisitMerge is stateless per (cur_pose, goal_pose) pair). Not started.
+        Ground-anchored per-trajectory scale (`scale_mode='ground'`, the default):
+        instead of the pooled constant, t_rel is multiplied by a PER-TRAJECTORY metric
+        scale recovered from LingBot's own geometry — VGP-Nav (arXiv:2606.09268) sec
+        III-E "Ground-Anchored Scale Recovery": the FULL frozen depth head is run on
+        the trajectory's num_scale scale-frames (the block that defines the map frame),
+        the points are unprojected into the map frame, and the dominant peak of the
+        height histogram below the cameras is the floor; scale = camera_height_m /
+        estimated_camera_to_floor — computed once per trajectory and cached
+        (LingBotStream.get_metric_scale, per-trajectory persistent by rgb_dir key).
+        In this mode aux_pose_head is initialized to the PURE axis conversion (R_conv,
+        no _SCALE), since t_rel is already metric when it arrives; samples whose floor
+        recovery failed (no confident floor points in the scale block) fall back to
+        the pooled _SCALE as their per-sample multiplier. `scale_mode='pooled'`
+        preserves the old single-constant behavior for comparison.
     """
 
     # See docstring above for how these were derived and their (known, per-video) limits.
     _R_CONV = ((0.0, 0.0, 1.0), (-1.0, 0.0, 0.0), (0.0, -1.0, 0.0))
     _SCALE = 2.564
 
-    def __init__(self, dim=384, n_out=4, aux_pose_calibration='empirical'):
+    def __init__(self, dim=384, n_out=4, aux_pose_calibration='empirical', scale_mode='ground'):
         super().__init__()
         self.revisit_head = nn.Linear(12, n_out * dim)       # [t_rel(3), R_rel.flatten(9)] -> n_out tokens
         self.n_out, self.dim = n_out, dim
         assert aux_pose_calibration in ('empirical', 'trainable'), aux_pose_calibration
+        assert scale_mode in ('ground', 'pooled'), scale_mode
         self.aux_pose_calibration = aux_pose_calibration
+        self.scale_mode = scale_mode
         # calibrated (x,y) readout, frozen or trainable per aux_pose_calibration — see class docstring
         self.aux_pose_head = nn.Linear(3, 2)
         R_conv = torch.tensor(self._R_CONV)
         with torch.no_grad():
-            self.aux_pose_head.weight.copy_(self._SCALE * R_conv[:2])
+            # 'ground': t_rel arrives already metric (per-trajectory scale applied in
+            # forward), so the head is the pure axis conversion; 'pooled': old behavior.
+            w = R_conv[:2] if scale_mode == 'ground' else self._SCALE * R_conv[:2]
+            self.aux_pose_head.weight.copy_(w)
             self.aux_pose_head.bias.zero_()
         self.aux_pose_head.requires_grad_(aux_pose_calibration == 'trainable')
 
@@ -231,9 +239,13 @@ class RevisitMerge(nn.Module):
         R_rel = R_cur_T @ R_goal                                         # R_cur^T R_goal
         return t_rel, R_rel
 
-    def forward(self, cur_pose, goal_pose):
-        """cur_pose, goal_pose: [B, 9] absolute camera poses (map frame)."""
+    def forward(self, cur_pose, goal_pose, metric_scale=None):
+        """cur_pose, goal_pose: [B, 9] absolute camera poses (map frame).
+        metric_scale: [B] per-trajectory lingbot-units -> meters multiplier
+        (ground-anchored; required when scale_mode='ground', ignored otherwise)."""
         t_rel, R_rel = self._relative_pose(cur_pose, goal_pose)          # [B,3], [B,3,3]
+        if self.scale_mode == 'ground':
+            t_rel = t_rel * metric_scale.to(t_rel).unsqueeze(-1)         # metric t_rel
         aux_pose = self.aux_pose_head(t_rel)                             # [B,2]  (x,y) only
         rel_feat = torch.cat([t_rel, R_rel.flatten(-2)], dim=-1)         # [B,12]
         revisit_readout = self.revisit_head(rel_feat).view(-1, self.n_out, self.dim)
@@ -251,7 +263,7 @@ class MemNavNet(nn.Module):
     def __init__(self, lingbot_kwargs=None, dino_dim=1024, lingbot_dim=2048, depth_feat_dim=256,
                  token_dim=384, heads=8, m_rgbd=4, m_depth=4, m_revisit=4, m_novel=4,
                  predict_size=24, temporal_depth=8, num_diffusion_iters=10, goal_warm=64,
-                 aux_pose_calibration='empirical', device="cuda"):
+                 aux_pose_calibration='empirical', scale_mode='ground', device="cuda"):
         super().__init__()
         self.lingbot = LingBotStream(device=device, **(lingbot_kwargs or {}))
         self.window = self.lingbot.window
@@ -276,7 +288,9 @@ class MemNavNet(nn.Module):
         self.compress_rgbd = TokenCompressor(token_dim, heads, m_rgbd)
         self.compress_depth = TokenCompressor(token_dim, heads, m_depth)
         # revisit: analytic relative pose from current + goal absolute camera poses (+ aux pose head)
-        self.revisit_merge = RevisitMerge(token_dim, m_revisit, aux_pose_calibration=aux_pose_calibration)
+        self.revisit_merge = RevisitMerge(token_dim, m_revisit, aux_pose_calibration=aux_pose_calibration,
+                                          scale_mode=scale_mode)
+        self.scale_mode = scale_mode
 
         # --- NavDP DDPM decoder (no critic) ---
         # memory layout: [ time(1) | current_state(n_cs) | revisit(n_rev) | novel(n_nov) ]
@@ -314,10 +328,11 @@ class MemNavNet(nn.Module):
         geom = self.compress_depth(self.proj_depth(depth_feat))  # [B, m_depth, token_dim]
         return torch.cat([rgbd, geom], dim=1)
 
-    def build_revisit(self, cur_pose, goal_pose):
-        """cur_pose/goal_pose [B, 9] absolute camera poses (current frame + goal_append_warm)
+    def build_revisit(self, cur_pose, goal_pose, metric_scale=None):
+        """cur_pose/goal_pose [B, 9] absolute camera poses (current frame + goal_append_warm),
+        metric_scale [B] per-trajectory ground-anchored scale (scale_mode='ground')
         -> (revisit_readout [B,m_revisit,token_dim], aux_pose [B,2] (x,y) only, R_rel [B,3,3])."""
-        return self.revisit_merge(cur_pose, goal_pose)
+        return self.revisit_merge(cur_pose, goal_pose, metric_scale)
 
     # ----- DDPM decoder ------------------------------------------------ #
     def _memory(self, current_state, revisit, novel, timestep):
@@ -353,7 +368,8 @@ class MemNavNet(nn.Module):
         dev = self.device
         enc = self.encode_memory(batch)
         current_state = self.build_current_state(enc["current"], enc["depth_feat"])
-        revisit, aux_pose, R_rel = self.build_revisit(enc["cur_pose"], enc["goal_pose"])
+        revisit, aux_pose, R_rel = self.build_revisit(enc["cur_pose"], enc["goal_pose"],
+                                                      enc["metric_scale"])
         novel = self.novel(batch["batch_window_images"][:, -1].to(dev),   # current frame [B,3,H,W]
                            batch["batch_goal_image"].to(dev))             # goal frame
         gate = enc["revisit_gate"]
@@ -399,8 +415,13 @@ class MemNavNet(nn.Module):
         # smoke episode). goal_pose still needs a live camera_pose() call — the goal image is
         # newly inserted, not a frame this array has an entry for.
         cam_pose_enc = torch.as_tensor(cc["cam_pose_enc"], device=self.device, dtype=torch.float32)
+        # whole-episode ground-anchored floor estimate stored by precompute
+        # (--skip_ground_scale omits it; NaN = stream saw no confident floor).
+        # None -> encode_memory falls back to the on-the-fly 64-frame estimate.
+        ghe = float(cc["ground_h_est"]) if "ground_h_est" in cc.files else float("nan")
         return dict(scale_k=sk, scale_v=sv, anchor_k=ak, anchor_v=av, cam_k=ck, cam_v=cv,
-                   cam_pose_enc=cam_pose_enc)
+                   cam_pose_enc=cam_pose_enc,
+                   ground_h_est=ghe if np.isfinite(ghe) else None)
 
     def encode_memory(self, batch):
         """Frozen front-end orchestration. Retrieval (trainable, batched) picks the
@@ -447,6 +468,7 @@ class MemNavNet(nn.Module):
         ks = [int(batch["cur_steps"][b]) for b in range(B)]
         cur_t = [None] * B; dfeat_t = [None] * B
         curp = [None] * B; goalp = [None] * B; goal_m = [None] * B
+        mscale = [RevisitMerge._SCALE] * B   # per-sample scale; pooled constant = fallback
         for s in range(0, B, G):
             idx = list(range(s, min(s + G, B)))
             with torch.no_grad():
@@ -474,6 +496,21 @@ class MemNavNet(nn.Module):
                     # cur_pose: read the precomputed continuous-stream pose directly (exact,
                     # no cold-start reconstruction) — k is always a real trajectory frame.
                     curp[b] = caches[jj]["cam_pose_enc"][k]                         # [9] current abs pose
+                    if self.scale_mode == 'ground':
+                        # ground-anchored per-trajectory metric scale. Preferred source:
+                        # the whole-episode ground_h_est stored in the cam cache by
+                        # precompute (zero runtime cost). Fallback for old caches: the
+                        # on-the-fly 64-frame estimate (cached by rgb_dir, ~2s once per
+                        # trajectory). Either way None -> pooled-constant fallback.
+                        ch = batch.get("batch_camera_height")
+                        cam_h = float(ch[b]) if ch is not None else 0.5
+                        if caches[jj]["ground_h_est"] is not None:
+                            s = ground_scale_from_h_est(caches[jj]["ground_h_est"], cam_h)
+                        else:
+                            s = self.lingbot.get_metric_scale(
+                                batch["rgb_dirs"][b], caches[jj]["cam_pose_enc"], cam_h)
+                        if s is not None:
+                            mscale[b] = s
                     m = int(anchor[b].clamp(lo, k - 1).item())
                     m_of[b] = m
                     goal_m[b] = m   # post-clamp anchor actually used for goal_pose (may differ from anchor[b])
@@ -511,6 +548,8 @@ class MemNavNet(nn.Module):
             depth_feat=torch.stack(dfeat_t), # [B, Pf, Cd]   depth-head geometry
             cur_pose=torch.stack(curp),      # [B, 9]        current absolute camera pose (map frame)
             goal_pose=torch.stack(goalp),    # [B, 9]        goal absolute camera pose (map frame)
+            metric_scale=torch.tensor(mscale, device=dev, dtype=torch.float32),  # [B] lingbot->meters
+
             match_idx=match_idx, anchor_idx=anchor, revisit_gate=revisit_gate,
             gate_logit=gate_logit, ret_logits=ret_logits,
             goal_anchor_idx=torch.tensor(goal_m, device=dev, dtype=torch.long),  # [B] post-clamp m used for goal_pose
@@ -569,6 +608,7 @@ class MemNavPolicy(PreTrainedModel):
             temporal_depth=il['temporal_depth'], num_diffusion_iters=il.get('num_diffusion_iters', 10),
             goal_warm=il.get('goal_warm', 64),
             aux_pose_calibration=il.get('aux_pose_calibration', 'empirical'),
+            scale_mode=il.get('scale_mode', 'ground'),
             lingbot_kwargs=lingbot_kwargs or None, device=str(self._device),
         )
 
@@ -625,7 +665,7 @@ if __name__ == "__main__":
         print(f"  cur_steps={batch['cur_steps']} goal_steps={batch['goal_steps']} match_idx={out['match_idx'].tolist()}")
         cs = net.build_current_state(out["current"], out["depth_feat"])
         nov = net.novel(batch["batch_window_images"][:, -1].to(net.device), batch["batch_goal_image"].to(net.device))
-        rr, ap, _R_rel = net.build_revisit(out["cur_pose"], out["goal_pose"])
+        rr, ap, _R_rel = net.build_revisit(out["cur_pose"], out["goal_pose"], out["metric_scale"])
         print(f"  current_state (RGBD+depth Perceiver): {tuple(cs.shape)} req_grad={cs.requires_grad}")
         print(f"  novel readout: {tuple(nov.shape)} req_grad={nov.requires_grad}")
         print(f"  revisit_readout: {tuple(rr.shape)} | aux_pose: {tuple(ap.shape)} req_grad={rr.requires_grad}")

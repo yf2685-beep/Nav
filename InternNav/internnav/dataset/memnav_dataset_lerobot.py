@@ -339,8 +339,10 @@ class MemNav_Dataset(NavDP_Base_Datset):
                 out.append(dict(has_covis=False, goal_j=-1, leg_start=0, goal_step=goal_step,
                                 k_lo=int(k_lo), k_hi=int(k_hi), goal_img_path=_rgb(a_frame),
                                 T_A=a_frame, amargin=amargin))
+        cam_h = float(meta.get('camera_height_m', 0.5))   # generator mount height (--cam_h)
         for sample in out:
             sample['frame_convention'] = frame_convention
+            sample['camera_height_m'] = cam_h
         return out
 
     def __len__(self):
@@ -508,6 +510,9 @@ class MemNav_Dataset(NavDP_Base_Datset):
             # by leg depth in the trainer. Independent of whether THIS sample's k
             # happened to land inside/outside the covis window (that's null_pos).
             'goal_j': int(s['goal_j']),
+            # true camera mount height (m) — anchors the ground-recovered per-trajectory
+            # metric scale (LingBotStream.get_metric_scale via encode_memory)
+            'camera_height': float(s.get('camera_height_m', 0.5)),
         }
 
 
@@ -554,6 +559,7 @@ def memnav_collate_fn(batch):
         'cur_steps':             [b['cur_step'] for b in batch],
         'goal_steps':            [b['goal_step'] for b in batch],
         'goal_js':               [b['goal_j'] for b in batch],   # -1=goal A, 0=goal B (leg2), 1=goal C (leg3), ...
+        'batch_camera_height':   [b.get('camera_height', 0.5) for b in batch],  # [B] mount height (m)
     }
 
 
