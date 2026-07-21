@@ -120,30 +120,38 @@ strips any visual meaning from the remaining coordinate's sign.
 It hid for months because **a constant-zero channel is trivial to fit** — action loss fell
 smoothly 0.33 → 0.088 and looked like textbook convergence.
 
-### The fix
+### The fix (upstream `fix_axis_bug`)
 
-Load-time, not a data regeneration: the parquets store the full 4×4, so the pose was
-mis-projected rather than lost. `_fix_stored_rotation` applies the missing `@ M_W.T` via a
-`MemNav_Dataset.process_data_parquet` override — deliberately not in `NavDP_Base_Datset`,
-which navdp/logoplanner share with data from other generators.
+The bug was fixed at the source: the writer now records the correct camera **mount** in
+`base_extrinsic` instead of identity, so NavDP's `R_action @ inv(R_mount)` removes it and
+the optical-forward axis lands in a coordinate `xyz_to_xyt` keeps. Legacy pt1/pt2 parquets
+(which carry an identity mount) are upgraded at load time by `resolve_memnav_base_extrinsic`
+in the new `internnav/dataset/memnav_pose_conventions.py`, keyed off the episode's
+`frame_convention` marker so no other dataset is touched. No data regeneration — the
+parquets store the full 4×4, so the pose was mis-projected, never lost. The same commit also
+wraps the heading delta to `[-π, π)` before the ×4 scaling, killing the ±4π theta artifact.
 
-A/B through the real dataset class, toggled by `MEMNAV_LEGACY_ROT_FRAME`:
+Verified on real data that this produces the same corrected labels an earlier, independent
+load-time fix (`R_stored @ M_W.T`) produced:
 
-| | LEGACY (old) | FIXED |
+| | broken (before) | fixed |
 |---|---|---|
-| ch0 std | 0.0000 | 0.3096 |
-| ch0 frac nonzero | 0.000 | 0.597 |
-| ch0 frac positive | 0.000 | **0.875** |
-| theta frac nonzero | 0.045 | 0.597 |
-| 2-D endpoint | 0.853 m | **1.796 m** |
+| ch0 (forward) std | 0.000 | **0.316** |
+| ch0 frac nonzero | 0.000 | 0.611 |
+| ch0 frac positive | 0.000 | **0.833** |
+| theta (ch2) frac nonzero | 0.045 | 0.611 |
+| 2-D endpoint | 0.853 m | **1.846 m** |
 
-1.796 m matches the independently measured true horizontal displacement (1.548 m mean).
-**ch1 (lateral) is byte-identical across both modes** — the change restores the missing
-channel and disturbs nothing that already worked. Theta was collateral damage too: the old
-4.5% nonzero values were all ±4π artifacts, since collinear points on a single surviving
-axis have no meaningful bearing.
+1.846 m matches the independently measured true horizontal displacement (1.548 m mean), and
+the forward channel is now dominated by positive (forward) motion. The lateral channel is
+unchanged — the fix restores the missing forward information and disturbs nothing that
+already worked.
 
-Upstream PR: [glbreeze/Nav#1](https://github.com/glbreeze/Nav/pull/1).
+History: this repository first shipped an equivalent load-time fix on the `memnav` branch
+(PR to the fork), which surfaced the bug and its evidence; upstream then landed the more
+complete source-level `fix_axis_bug` (with unit tests and the theta wrap), and this branch
+was rebased onto it. Both correct the same defect — applying both would double-correct, so
+only upstream's is kept.
 
 ---
 
