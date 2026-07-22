@@ -140,7 +140,10 @@ class MemNavTrainer(BaseTrainer):
         lse_pn = ret_logits.masked_fill(~(pos | neg), NEG_INF).logsumexp(-1)
         lse_p = ret_logits.masked_fill(~pos, NEG_INF).logsumexp(-1)
         rank_rows = pos.any(-1) & neg.any(-1)                    # [B] revisit rows w/ contrastive signal
-        rank_loss = ((lse_pn - lse_p) * rank_rows).sum() / rank_rows.sum().clamp(min=1.0)
+        # Index first. On novel rows lse_p is the finite dtype floor; forming the
+        # difference and multiplying by zero later creates a value near float32 max
+        # that overflows to inf/NaN under mixed-precision backward.
+        rank_loss = (lse_pn[rank_rows] - lse_p[rank_rows]).sum() / rank_rows.sum().clamp(min=1.0)
         # (b) gate BCE over ALL rows; pos_weight offsets the novel-heavy class mix
         n_rev = is_rev.sum()
         pos_weight = ((1.0 - is_rev).sum() / n_rev.clamp(min=1.0)).clamp(0.1, 10.0)
@@ -372,7 +375,7 @@ class MemNavTrainer(BaseTrainer):
     def get_train_dataloader(self):
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
-        sampler = DistributedSampler(self.train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=1234)
+        sampler = DistributedSampler(self.train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=self.args.seed)
         return DataLoader(
             self.train_dataset,
             batch_size=self.config.il.batch_size,

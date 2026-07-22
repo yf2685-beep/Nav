@@ -332,7 +332,7 @@ def main(config, model_class, model_config_class):
             save_steps=getattr(config.il, 'save_interval_steps', None) or config.il.save_interval_epochs,
             save_total_limit=8,
             report_to=config.il.report_to,
-            seed=0,
+            seed=int(getattr(config, 'seed', None) or 0),
             do_eval=False,
             ddp_find_unused_parameters=config.il.ddp_find_unused_parameters,
             ddp_bucket_cap_mb=100,
