@@ -41,12 +41,28 @@ Run (in the lingbot-map / torch-2.8 env). Smoke-test on one trajectory first:
 """
 
 import argparse
+import hashlib
+import json
 import os
+import subprocess
 import sys
+import traceback
 
 import numpy as np
 import torch
 from tqdm import tqdm
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from internnav.model.basemodel.memnav.cache_schema import (
+    CACHE_SCHEMA_VERSION,
+    DEFAULT_KEYFRAME_BUDGET,
+    KEYFRAME_POLICY,
+    auto_keyframe_interval,
+    validate_cache_files,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +100,74 @@ def find_trajectories(root_dirs):
     return trajectories
 
 
+def select_trajectories(trajectories, root_dirs, trajectory_list=""):
+    """Select an explicit, ordered subset from a newline-delimited manifest.
+
+    Each non-empty, non-comment line is an episode path relative to ``root_dirs``.
+    A tab-delimited diagnostic suffix is allowed so the strict-coverage report can
+    be passed directly.  Unknown or duplicate episodes are rejected rather than
+    silently ignored.
+    """
+    if not trajectory_list:
+        return trajectories
+
+    by_relpath = {
+        os.path.relpath(item[0], root_dirs): item
+        for item in trajectories
+    }
+    requested = []
+    seen = set()
+    duplicates = set()
+    with open(trajectory_list, encoding="utf-8") as manifest:
+        for line_number, raw_line in enumerate(manifest, start=1):
+            episode = raw_line.split("\t", 1)[0].strip().rstrip("/")
+            if not episode or episode.startswith("#"):
+                continue
+            normalized = os.path.normpath(episode)
+            if os.path.isabs(normalized) or normalized == ".." or normalized.startswith("../"):
+                raise ValueError(
+                    f"{trajectory_list}:{line_number}: episode must be relative to "
+                    f"root_dirs, got {episode!r}"
+                )
+            if normalized in seen:
+                duplicates.add(normalized)
+            seen.add(normalized)
+            requested.append(normalized)
+
+    if not requested:
+        raise ValueError(f"No episode paths found in {trajectory_list}")
+    if duplicates:
+        raise ValueError(
+            f"Duplicate episode(s) in {trajectory_list}: {sorted(duplicates)[:5]}"
+        )
+    missing = [episode for episode in requested if episode not in by_relpath]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} episode(s) from {trajectory_list} were not found under "
+            f"{root_dirs}: {missing[:5]}"
+        )
+    return [by_relpath[episode] for episode in requested]
+
+
+def validate_frame_capacity(trajectories, max_frame_num):
+    """Fail before GPU work if temporal RoPE cannot represent an episode."""
+    too_long = [
+        (traj_dir, len(rgb_paths))
+        for traj_dir, _rgb_dir, rgb_paths in trajectories
+        if len(rgb_paths) > max_frame_num
+    ]
+    if too_long:
+        examples = "; ".join(
+            f"{traj_dir} ({length} frames)" for traj_dir, length in too_long[:5]
+        )
+        raise ValueError(
+            f"max_frame_num={max_frame_num} is too small for {len(too_long)} "
+            f"trajectory/trajectories; temporal RoPE would be truncated. Examples: "
+            f"{examples}. Set --max_frame_num to at least "
+            f"{max(length for _traj_dir, length in too_long)}."
+        )
+
+
 def _atomic_savez(path, **arrays):
     """np.savez to a sibling .tmp then os.replace(path) so the final file is never
     partially written. Writing to an open handle avoids numpy's auto ".npz" suffixing."""
@@ -93,6 +177,85 @@ def _atomic_savez(path, **arrays):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _sha256_file(path, chunk_size=16 * 1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _git_revision(path):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", os.fspath(path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _resolve_keyframe_interval(args, num_frames):
+    if args.auto_keyframe_interval:
+        return auto_keyframe_interval(num_frames, args.keyframe_budget)
+    if args.keyframe_interval < 1:
+        raise ValueError(
+            f"--keyframe_interval must be positive, got {args.keyframe_interval}"
+        )
+    return int(args.keyframe_interval)
+
+
+def _precompute_provenance(args):
+    """Immutable configuration shared by both files of every generated pair."""
+    weights_sha256 = _sha256_file(args.weights) if args.weights else "none"
+    lingbot_revision = _git_revision(args.lingbot_repo)
+    if lingbot_revision == "unknown":
+        raise RuntimeError(
+            f"LINGBOT_REPO must be an auditable git checkout: {args.lingbot_repo}"
+        )
+    internnav_revision = _git_revision(PROJECT_ROOT)
+    if internnav_revision == "unknown":
+        raise RuntimeError(f"InternNav must be inside an auditable git checkout: {PROJECT_ROOT}")
+    config = {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "keyframe_policy": KEYFRAME_POLICY,
+        "internnav_revision": internnav_revision,
+        "precompute_script_sha256": _sha256_file(__file__),
+        "cache_schema_sha256": _sha256_file(
+            os.path.join(
+                PROJECT_ROOT,
+                "internnav/model/basemodel/memnav/cache_schema.py",
+            )
+        ),
+        "keyframe_interval_mode": (
+            f"auto_budget_{args.keyframe_budget}"
+            if args.auto_keyframe_interval
+            else f"fixed_{args.keyframe_interval}"
+        ),
+        "lingbot_revision": lingbot_revision,
+        "weights_sha256": weights_sha256,
+        "image_size": args.image_size,
+        "patch_size": args.patch_size,
+        "num_scale_frames": args.num_scale_frames,
+        "kv_cache_sliding_window": args.kv_cache_sliding_window,
+        "enable_3d_rope": bool(args.enable_3d_rope),
+        "max_frame_num": args.max_frame_num,
+        "camera_num_iterations": args.camera_num_iterations,
+        "use_sdpa": bool(args.use_sdpa),
+        "preprocess_mode": args.preprocess_mode,
+        "dtype": args.dtype,
+        "skip_ground_scale": bool(args.skip_ground_scale),
+        "ground_stride": args.ground_stride,
+    }
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    signature = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return payload, signature
 
 
 # --------------------------------------------------------------------------- #
@@ -117,7 +280,12 @@ def build_model(args, device):
         ckpt = torch.load(args.weights, map_location=device, weights_only=False)
         state_dict = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        print(f"  loaded weights: {len(missing)} missing, {len(unexpected)} unexpected keys")
+        if missing or unexpected:
+            raise RuntimeError(
+                f"LingBot checkpoint mismatch: missing={len(missing)} "
+                f"unexpected={len(unexpected)}"
+            )
+        print("  loaded weights: exact key match")
 
     # --- 3D-RoPE frame-table extension --------------------------------------- #
     # WanRotaryPosEmbed precomputes an ANALYTIC (untrained) frequency table of shape
@@ -157,20 +325,30 @@ def build_model(args, device):
 # Per-trajectory KV-cache + CLS capture
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False, skip_scale=False,
-                       ground_helpers=None, ground_stride=1):
+def extract_trajectory(
+    model,
+    images,
+    scale_frames,
+    dino_capture,
+    cam_only=False,
+    skip_scale=False,
+    keyframe_interval=1,
+    ground_helpers=None,
+    ground_stride=1,
+):
     """Stream `images` [1, S, 3, H, W] through the aggregator + camera head,
     capturing per-frame KV caches (and the DINOv2 CLS token).
 
     Aggregator cache (skipped when `cam_only`):
       * ``scale_k`` / ``scale_v``  [L, H, scale, P, d]   full K/V of the `scale` block.
-      * ``anchor_k`` / ``anchor_v`` [S-scale, L, H, 6, d] each later frame's specials.
+      * ``anchor_k`` / ``anchor_v`` [K, L, H, 6, d] selected later-frame specials.
+      * ``anchor_frame_indices`` [K] raw frame indices represented by those KVs.
       * ``dino_cls`` [S, D']  context-free DINOv2 CLS token (symmetric match key).
 
     Camera-head cache (always — the pose-specialized feature for revisit/aux-pose):
-      * ``cam_k`` / ``cam_v`` [S, NI, TD, H, d]  the single camera token's K/V across
+      * ``cam_k`` / ``cam_v`` [scale+K, NI, TD, H, d] the selected camera-token K/V across
             num_iterations × trunk_depth, captured the step each frame is current.
-            Injected [0..m] at train/eval time so the camera head relocalizes the goal.
+      * ``cam_frame_indices`` [scale+K] raw indices represented by those KVs.
       * ``cam_pose_enc`` [S, 9]  the head's NATIVE streaming pose (absT, quaR, FoV)
             per frame — empirically decodes as cam-to-world (despite the VGGT-derived
             w2c docstring). Used for metric calibration (per-traj monocular scale /
@@ -196,6 +374,16 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     B, S = images.shape[0], images.shape[1]
     assert B == 1
     scale = min(scale_frames, S)
+    keyframe_interval = int(keyframe_interval)
+    if keyframe_interval < 1:
+        raise ValueError(
+            f"keyframe_interval must be positive, got {keyframe_interval}"
+        )
+    if keyframe_interval > 1 and not hasattr(model, "_set_skip_append"):
+        raise RuntimeError(
+            "sparse keyframe precompute requires LingBot GCTStream._set_skip_append; "
+            "update LINGBOT_REPO before generating caches"
+        )
 
     model.clean_kv_cache()
     dev = next(model.parameters()).device
@@ -232,6 +420,7 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
         return ks.permute(3, 0, 1, 2, 4).contiguous(), vs.permute(3, 0, 1, 2, 4).contiguous()
 
     cam_k_list, cam_v_list, cam_pose_list = [], [], []
+    cam_frame_indices = list(range(scale))
     gs_heights, gs_frames, gs_off = [], [], [0]
 
     def pool_ground(agg_tokens, frame_imgs, pose9):
@@ -257,19 +446,45 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
             scale_k, scale_v = read_cache_full(slice(0, scale))  # [L,H,scale,P,d]
 
     # Phase 2: causal streaming, one frame at a time.
-    anchor_k_list, anchor_v_list = [], []
+    anchor_k_list, anchor_v_list, anchor_frame_indices = [], [], []
     for i in range(scale, S):
+        is_keyframe = (
+            keyframe_interval <= 1
+            or (i - scale) % keyframe_interval == 0
+        )
+        if not is_keyframe:
+            model._set_skip_append(True)
         frame = images[:, i:i + 1].to(dev, non_blocking=True)
-        agg_tok, _ = model._aggregate_features(frame, num_frame_for_scale=scale, num_frame_per_block=1)
-        pl = ch(agg_tok, causal_inference=True, num_frame_per_block=1, num_frame_for_scale=scale)
+        try:
+            agg_tok, _ = model._aggregate_features(
+                frame, num_frame_for_scale=scale, num_frame_per_block=1
+            )
+            pl = ch(
+                agg_tok,
+                causal_inference=True,
+                num_frame_per_block=1,
+                num_frame_for_scale=scale,
+            )
+        finally:
+            if not is_keyframe:
+                model._set_skip_append(False)
         cam_pose_list.append(pl[-1][0].float().cpu())        # [1, 9]
-        ck, cv = read_cam_newest(1); cam_k_list.append(ck); cam_v_list.append(cv)
         if ground_helpers is not None and (i - scale) % ground_stride == 0:
+            # Dense per-frame output like cam_pose_enc — pooled regardless of
+            # keyframe status (only the KV memory is sparsified).
             pool_ground(agg_tok, frame, pl[-1][0].float())
+        if is_keyframe:
+            ck, cv = read_cam_newest(1)
+            cam_k_list.append(ck)
+            cam_v_list.append(cv)
+            cam_frame_indices.append(i)
         if not cam_only:
             cls_list.append(pop_cls(1))
-            ak, av = read_cache_anchor_newest(psi)
-            anchor_k_list.append(ak); anchor_v_list.append(av)
+            if is_keyframe:
+                ak, av = read_cache_anchor_newest(psi)
+                anchor_k_list.append(ak)
+                anchor_v_list.append(av)
+                anchor_frame_indices.append(i)
 
     model.clean_kv_cache()
 
@@ -278,6 +493,7 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     cam_v = torch.cat(cam_v_list, 0).numpy()
     out = {"cam_k": cam_k, "cam_v": cam_v,
            "cam_pose_enc": torch.cat(cam_pose_list, 0).numpy(),   # [S, 9]
+           "cam_frame_indices": np.asarray(cam_frame_indices, dtype=np.int64),
            "cam_meta": np.array([NI, TD, Hh, d], dtype=np.int64)}
     if ground_helpers is not None:
         h_est, gdbg = ground_helpers[1](torch.cat(gs_heights), torch.cat(gs_frames))
@@ -297,6 +513,7 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     out.update({
         "dino_cls": torch.cat(cls_list, dim=0).numpy(),          # [S, D']
         "anchor_k": anchor_k, "anchor_v": anchor_v,              # [S-scale, L, H, psi, d]
+        "anchor_frame_indices": np.asarray(anchor_frame_indices, dtype=np.int64),
         "meta": np.array([scale, psi, L, Hh, d], dtype=np.int64),
     })
     if not skip_scale:
@@ -317,10 +534,23 @@ def main():
     ap.add_argument("--patch_size", type=int, default=14)
     ap.add_argument("--num_scale_frames", type=int, default=8)
     ap.add_argument("--kv_cache_sliding_window", type=int, default=8)
+    keyframes = ap.add_mutually_exclusive_group()
+    keyframes.add_argument(
+        "--keyframe_interval", type=int, default=1,
+        help="Append post-scale KVs every N raw frames (1 keeps the legacy dense cache).",
+    )
+    keyframes.add_argument(
+        "--auto_keyframe_interval", action="store_true",
+        help="Use LingBot's per-trajectory ceil(num_frames / keyframe_budget) policy.",
+    )
+    ap.add_argument(
+        "--keyframe_budget", type=int, default=DEFAULT_KEYFRAME_BUDGET,
+        help="Temporal-view budget used by --auto_keyframe_interval (official default: 320).",
+    )
     ap.add_argument("--enable_3d_rope", action="store_true", default=True,
                     help="Temporal 3D RoPE (LingBot's intended mode). Needed for goal time-index placement.")
-    ap.add_argument("--max_frame_num", type=int, default=1024,
-                    help="Max frames for 3D RoPE (>= longest trajectory; dataset max is 342).")
+    ap.add_argument("--max_frame_num", type=int, default=4096,
+                    help="Max frames for 3D RoPE; must cover the longest selected trajectory.")
     ap.add_argument("--camera_num_iterations", type=int, default=4)
     ap.add_argument("--use_sdpa", action="store_true", default=False,
                     help="Use SDPA attention (no FlashInfer dependency). Recommended.")
@@ -351,12 +581,21 @@ def main():
                     help="Recompute even if the output npz already exists.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Process at most N trajectories (0 = all). For smoke tests.")
+    ap.add_argument("--trajectory_list", default="",
+                    help="Optional newline-delimited episode paths relative to root_dirs. "
+                         "Tab-delimited suffixes are ignored, so a strict-coverage report "
+                         "can be used directly.")
     ap.add_argument("--num_shards", type=int, default=1,
                     help="Divide the traj list into this many interleaved shards.")
     ap.add_argument("--shard", type=int, default=0,
                     help="Which shard [0, num_shards) to process. Combine with SLURM array to parallelize.")
     ap.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
     args = ap.parse_args()
+
+    if args.keyframe_interval < 1:
+        ap.error("--keyframe_interval must be positive")
+    if args.keyframe_budget < 1:
+        ap.error("--keyframe_budget must be positive")
 
     sys.path.insert(0, args.lingbot_repo)
     from lingbot_map.utils.load_fn import load_and_preprocess_images
@@ -376,10 +615,36 @@ def main():
         _spec.loader.exec_module(_mod)
         ground_helpers = (_mod.ground_frame_heights, _mod.ground_h_est_from_heights)
 
+    all_trajectories = find_trajectories(args.root_dirs)
+    total = len(all_trajectories)
+    trajectories = select_trajectories(
+        all_trajectories, args.root_dirs, args.trajectory_list
+    )
+    selected = len(trajectories)
+    if args.num_shards > 1:
+        assert 0 <= args.shard < args.num_shards, f"--shard {args.shard} out of [0, {args.num_shards})"
+        trajectories = trajectories[args.shard::args.num_shards]  # interleaved for load balance
+    if args.limit:
+        trajectories = trajectories[:args.limit]
+    validate_frame_capacity(trajectories, args.max_frame_num)
+    print(f"Found {total} trajectories under {args.root_dirs}; "
+          f"selected {selected}; "
+          f"processing {len(trajectories)} on shard {args.shard}/{args.num_shards}")
+
     device = torch.device(args.device)
     autocast_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
 
     model = build_model(args, device)
+    if (
+        args.auto_keyframe_interval or args.keyframe_interval > 1
+    ) and not hasattr(model, "_set_skip_append"):
+        raise RuntimeError(
+            "sparse keyframe precompute requires LingBot GCTStream._set_skip_append"
+        )
+
+    precompute_config_json, precompute_signature = _precompute_provenance(args)
+    print(f"precompute_signature={precompute_signature}")
+    print(f"precompute_config={precompute_config_json}")
 
     # Forward hook on the DINOv2 patch embedder to capture the context-free
     # descriptor as it is computed inside _embed_images.
@@ -389,16 +654,6 @@ def main():
         dino_capture[0] = out
 
     handle = model.aggregator.patch_embed.register_forward_hook(hook)
-
-    trajectories = find_trajectories(args.root_dirs)
-    total = len(trajectories)
-    if args.num_shards > 1:
-        assert 0 <= args.shard < args.num_shards, f"--shard {args.shard} out of [0, {args.num_shards})"
-        trajectories = trajectories[args.shard::args.num_shards]  # interleaved for load balance
-    if args.limit:
-        trajectories = trajectories[:args.limit]
-    print(f"Found {total} trajectories under {args.root_dirs}; "
-          f"processing {len(trajectories)} on shard {args.shard}/{args.num_shards}")
 
     n_done, n_skip, n_err = 0, 0, 0
     for traj_dir, rgb_dir, rgb_paths in tqdm(trajectories, desc="trajectories"):
@@ -412,10 +667,60 @@ def main():
         out_path = os.path.join(dst_dir, args.out_name)
         cam_path = os.path.join(dst_dir, args.cam_out_name)
         gate_path = cam_path if args.cam_only else out_path
+        keyframe_interval = _resolve_keyframe_interval(args, len(rgb_paths))
         if os.path.exists(gate_path) and not args.overwrite:
+            if not os.path.isfile(out_path) or not os.path.isfile(cam_path):
+                raise RuntimeError(
+                    f"partial cache pair at {dst_dir}; remove only after review or "
+                    "rerun with --overwrite"
+                )
+            layout = validate_cache_files(
+                out_path,
+                cam_path,
+                expected_num_frames=len(rgb_paths),
+                expected_num_scale_frames=min(args.num_scale_frames, len(rgb_paths)),
+                expected_sliding_window=args.kv_cache_sliding_window,
+                require_versioned=True,
+            )
+            if layout.precompute_signature != precompute_signature:
+                raise RuntimeError(
+                    f"existing cache signature differs at {dst_dir}: "
+                    f"{layout.precompute_signature} != {precompute_signature}; "
+                    "use a new out_root rather than mixing precompute runs"
+                )
+            if layout.keyframe_interval != keyframe_interval:
+                raise RuntimeError(
+                    f"existing cache interval differs at {dst_dir}: "
+                    f"{layout.keyframe_interval} != {keyframe_interval}"
+                )
             n_skip += 1
             continue
         try:
+            if args.cam_only:
+                if not os.path.isfile(out_path):
+                    raise RuntimeError(
+                        f"--cam_only requires an existing versioned aggregator cache: {out_path}"
+                    )
+                with np.load(out_path, allow_pickle=False) as existing:
+                    required = {
+                        "cache_schema_version", "precompute_signature",
+                        "keyframe_interval", "num_frames",
+                    }
+                    missing = sorted(required - set(existing.files))
+                    if missing:
+                        raise RuntimeError(
+                            f"--cam_only cannot pair with legacy/incomplete aggregator "
+                            f"{out_path}; missing={missing}; run a full precompute"
+                        )
+                    if str(existing["precompute_signature"].item()) != precompute_signature:
+                        raise RuntimeError(
+                            "--cam_only precompute signature differs from aggregator; "
+                            "run a full precompute into a new out_root"
+                        )
+                    if int(existing["keyframe_interval"].item()) != keyframe_interval:
+                        raise RuntimeError("--cam_only keyframe interval differs from aggregator")
+                    if int(existing["num_frames"].item()) != len(rgb_paths):
+                        raise RuntimeError("--cam_only frame count differs from aggregator")
             images = load_and_preprocess_images(
                 rgb_paths,
                 mode=args.preprocess_mode,
@@ -427,25 +732,48 @@ def main():
                 feats = extract_trajectory(
                     model, images, args.num_scale_frames, dino_capture,
                     cam_only=args.cam_only, skip_scale=args.skip_scale,
+                    keyframe_interval=keyframe_interval,
                     ground_helpers=ground_helpers, ground_stride=args.ground_stride,
                 )
-            assert np.isfinite(feats["cam_k"]).all(), "non-finite cam_k"
+            for name in ("cam_k", "cam_v", "cam_pose_enc"):
+                assert np.isfinite(feats[name]).all(), f"non-finite {name}"
+            shared_metadata = dict(
+                cache_schema_version=np.array([CACHE_SCHEMA_VERSION], dtype=np.int64),
+                keyframe_policy=np.array([KEYFRAME_POLICY]),
+                num_frames=np.array([len(rgb_paths)], dtype=np.int64),
+                num_scale_frames=np.array(
+                    [min(args.num_scale_frames, len(rgb_paths))], dtype=np.int64
+                ),
+                keyframe_interval=np.array([keyframe_interval], dtype=np.int64),
+                kv_cache_sliding_window=np.array(
+                    [args.kv_cache_sliding_window], dtype=np.int64
+                ),
+                precompute_signature=np.array([precompute_signature]),
+                precompute_config_json=np.array([precompute_config_json]),
+            )
             # Camera-head cache (always) — small; np.savez (ZIP_STORED) avoids slow deflate.
             # ATOMIC write: savez into a .tmp *file handle* (writing to a handle skips numpy's
             # ".npz" suffix munging), fsync, then os.replace. A crash mid-write (node death,
             # timeout, OOM) leaves only a .tmp the skip-if-exists gate ignores — never a
             # truncated final cache that would be silently treated as "done".
             _atomic_savez(cam_path, cam_k=feats["cam_k"], cam_v=feats["cam_v"],
-                          cam_pose_enc=feats["cam_pose_enc"], cam_meta=feats["cam_meta"],
+                          cam_pose_enc=feats["cam_pose_enc"],
+                          cam_frame_indices=feats["cam_frame_indices"],
+                          cam_meta=feats["cam_meta"],
                           **({"ground_h_est": feats["ground_h_est"],
                               "ground_dbg": feats["ground_dbg"]}
-                             if "ground_h_est" in feats else {}))
+                             if "ground_h_est" in feats else {}),
+                          **shared_metadata)
             if not args.cam_only:
                 assert np.isfinite(feats["dino_cls"]).all(), "non-finite dino_cls"
+                assert np.isfinite(feats["anchor_k"]).all(), "non-finite anchor_k"
+                assert np.isfinite(feats["anchor_v"]).all(), "non-finite anchor_v"
                 save_kwargs = dict(
                     dino_cls=feats["dino_cls"].astype(np.float16),
                     anchor_k=feats["anchor_k"], anchor_v=feats["anchor_v"],
+                    anchor_frame_indices=feats["anchor_frame_indices"],
                     meta=feats["meta"],
+                    **shared_metadata,
                 )
                 if not args.skip_scale:
                     assert np.isfinite(feats["scale_k"]).all(), "non-finite scale_k"
@@ -453,13 +781,33 @@ def main():
                     save_kwargs["scale_v"] = feats["scale_v"]
                 # out_path (gate file) written LAST + atomically, so it appears only once complete.
                 _atomic_savez(out_path, **save_kwargs)
+            layout = validate_cache_files(
+                out_path,
+                cam_path,
+                expected_num_frames=len(rgb_paths),
+                expected_num_scale_frames=min(args.num_scale_frames, len(rgb_paths)),
+                expected_sliding_window=args.kv_cache_sliding_window,
+                require_versioned=True,
+            )
+            if (
+                layout.precompute_signature != precompute_signature
+                or layout.keyframe_interval != keyframe_interval
+            ):
+                raise RuntimeError("post-write cache metadata validation failed")
             n_done += 1
         except Exception as e:  # noqa: BLE001 — keep going, report at the end
             n_err += 1
             print(f"[ERROR] {traj_dir}: {e}")
+            traceback.print_exc()
 
     handle.remove()
     print(f"Done. computed={n_done} skipped={n_skip} errors={n_err}")
+    if n_err:
+        raise RuntimeError(
+            f"LingBot precomputation failed for {n_err} trajectory/trajectories; "
+            "see the tracebacks above. Partial successful outputs are retained and "
+            "a rerun will skip them."
+        )
 
 
 if __name__ == "__main__":
