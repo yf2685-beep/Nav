@@ -44,6 +44,11 @@ _SAVE_STEPS = int(os.environ.get('MEMNAV_SAVE_STEPS', '100'))
 # upstream camera poses are frozen). Both remain a per-video-scale-ambiguity-limited
 # diagnostic, not a precision signal -- see the ground-anchored-scale TODO there.
 _AUX_POSE_CALIBRATION = os.environ.get('MEMNAV_AUX_POSE_CALIBRATION', 'empirical')
+# ground-scale clamp ceiling (scale_mode='ground'): corrected per-episode estimates above
+# this are CLAMPED to it (not discarded). Default 6.0 leaves ~95.6% of pt1 episodes
+# untouched; the ~4% above clamp to 6.0 (beats the old reject-to-constant in every band)
+# — see lingbot_stream.GROUND_SCALE_RANGE / diag_ground_scale_sweep.py.
+_GROUND_SCALE_MAX = float(os.environ.get('MEMNAV_GROUND_SCALE_MAX', '6.0'))
 
 memnav_exp_cfg = ExpCfg(
     name='memnav_train',
@@ -105,6 +110,8 @@ memnav_exp_cfg = ExpCfg(
         goal_warm=64,
         aux_pose_calibration=_AUX_POSE_CALIBRATION,
         require_versioned_cache=_REQUIRE_VERSIONED_CACHE,
+        # ground-scale gate ceiling (MEMNAV_GROUND_SCALE_MAX; scale_mode='ground')
+        ground_scale_max=_GROUND_SCALE_MAX,
         # policy / diffusion
         predict_size=24,
         temporal_depth=8,

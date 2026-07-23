@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --account=torch_pr_769_tandon_advanced
 #SBATCH --partition=a100_tandon,h100_tandon,h200_tandon
 #SBATCH --gres=gpu:2
@@ -22,8 +22,11 @@
 # Inside the container the frames appear at /mp3d_revisit_v0/vln_n1/traj_data, which is
 # MEMNAV_ROOT_DIR; caches are read from MEMNAV_FEATURE_ROOT on host /scratch. The
 # dataset only enumerates trajectories that HAVE a cache (memnav_dataset_lerobot.py
-# skips uncached ones), so this is safe to run while shards 4-7 are still precomputing —
-# it trains on whatever is ready (currently ~1788 of 1944 trajectories).
+# skips uncached ones). The pt1 cam caches are COMPLETE (1919 trajectories: 736 two-leg
+# + 1183 three-leg <=2048 frames, each with the whole-episode ground_h_est for
+# scale_mode='ground'); 25 long (>2048-frame) three-leg episodes were intentionally
+# dropped. Both training fixes are live: per-trajectory ground-scale rescale of t_rel
+# (scale_mode='ground', policy default) and the rank_loss NaN-overflow fix (9b93877).
 #
 # CONSISTENCY (critical): the memory partition geometry MUST match the precompute.
 # The caches were built with --kv_cache_sliding_window 32 and --max_frame_num 2048, so:
@@ -46,6 +49,9 @@
 #   NUM_WORKERS=8            (per-GPU)
 #   NPROC=2                  (GPUs / DDP ranks; must be <= --gres=gpu:N)
 #   MEMNAV_MAX_LEGS=2        (2 = two-leg episodes only; unset/0 = all legs)
+#   MEMNAV_GROUND_SCALE_MAX=6.0  (ground-scale clamp ceiling; corrected per-episode scale
+#                            estimates above this are CLAMPED to it. 6.0 leaves ~95.6% of
+#                            pt1 eps untouched; the ~4% above clamp to 6.0.)
 #   MEMNAV_STREAM_GROUP=1    (per-sample streaming; >1 batches G streams in encode_memory)
 #   MEMNAV_REPORT_TO=wandb   (wandb | tensorboard | none)
 #
@@ -84,6 +90,12 @@ export MEMNAV_STREAM_GROUP=${MEMNAV_STREAM_GROUP:-1}
 # episode leg filter: 2 = train on two-leg episodes only (drops three-leg goal-C
 # episodes). Read by scripts/train/configs/memnav.py -> MemNav_Dataset(max_legs=...).
 export MEMNAV_MAX_LEGS=${MEMNAV_MAX_LEGS:-2}
+
+# ground-scale clamp ceiling (scale_mode='ground'): corrected per-episode scale estimates
+# above this are CLAMPED to it (ground_scale_from_h_est clamps, no longer rejects). Default
+# 6.0 (was 4.0) leaves ~95.6% of pt1 episodes untouched; the ~4% above clamp to 6.0.
+# memnav.py -> IlCfg -> MemNavNet.ground_scale_range -> ground_scale_from_h_est(scale_range=).
+export MEMNAV_GROUND_SCALE_MAX=${MEMNAV_GROUND_SCALE_MAX:-6.0}
 
 # checkpoint every N optimizer steps (memnav.py -> save_strategy='steps'). train.py
 # auto-resumes from the latest checkpoint in checkpoints/<NAME>/ckpts, so a re-submitted

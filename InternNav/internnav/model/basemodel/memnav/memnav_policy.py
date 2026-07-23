@@ -24,7 +24,8 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from transformers import PretrainedConfig, PreTrainedModel
 
 from internnav.model.basemodel.memnav.cache_schema import validate_cache_pair
-from internnav.model.basemodel.memnav.lingbot_stream import LingBotStream, ground_scale_from_h_est
+from internnav.model.basemodel.memnav.lingbot_stream import (
+    LingBotStream, ground_scale_from_h_est, GROUND_SCALE_RANGE)
 from internnav.model.encoder.navdp_backbone import (
     LearnablePositionalEncoding,
     NavDP_ImageGoal_Backbone,
@@ -264,9 +265,14 @@ class MemNavNet(nn.Module):
     def __init__(self, lingbot_kwargs=None, dino_dim=1024, lingbot_dim=2048, depth_feat_dim=256,
                  token_dim=384, heads=8, m_rgbd=4, m_depth=4, m_revisit=4, m_novel=4,
                  predict_size=24, temporal_depth=8, num_diffusion_iters=10, goal_warm=64,
-                 aux_pose_calibration='empirical', scale_mode='ground',
+                 aux_pose_calibration='empirical', scale_mode='ground', ground_scale_max=None,
                  require_versioned_cache=False, device="cuda"):
         super().__init__()
+        # ground-scale gate ceiling (scale_mode='ground'): corrected estimates above this
+        # fall back to the pooled constant. None -> module default GROUND_SCALE_RANGE[1].
+        self.ground_scale_range = (GROUND_SCALE_RANGE[0],
+                                   float(ground_scale_max) if ground_scale_max is not None
+                                   else GROUND_SCALE_RANGE[1])
         self.lingbot = LingBotStream(device=device, **(lingbot_kwargs or {}))
         self.window = self.lingbot.window
         self.num_scale = self.lingbot.num_scale
@@ -530,11 +536,14 @@ class MemNavNet(nn.Module):
                         # the whole-episode ground_h_est stored in the cam cache by
                         # precompute (zero runtime cost). Fallback for old caches: the
                         # on-the-fly 64-frame estimate (cached by rgb_dir, ~2s once per
-                        # trajectory). Either way None -> pooled-constant fallback.
+                        # trajectory). ground_scale_from_h_est now CLAMPS to
+                        # self.ground_scale_range, so s is None only when the estimate is
+                        # genuinely invalid (no confident floor) -> pooled-constant fallback.
                         ch = batch.get("batch_camera_height")
                         cam_h = float(ch[b]) if ch is not None else 0.5
                         if caches[jj]["ground_h_est"] is not None:
-                            s = ground_scale_from_h_est(caches[jj]["ground_h_est"], cam_h)
+                            s = ground_scale_from_h_est(caches[jj]["ground_h_est"], cam_h,
+                                                        scale_range=self.ground_scale_range)
                         else:
                             s = self.lingbot.get_metric_scale(
                                 batch["rgb_dirs"][b], caches[jj]["cam_pose_enc"], cam_h)
@@ -641,6 +650,7 @@ class MemNavPolicy(PreTrainedModel):
             aux_pose_calibration=il.get('aux_pose_calibration', 'empirical'),
             scale_mode=il.get('scale_mode', 'ground'),
             require_versioned_cache=bool(il.get('require_versioned_cache', False)),
+            ground_scale_max=il.get('ground_scale_max'),
             lingbot_kwargs=lingbot_kwargs or None, device=str(self._device),
         )
 

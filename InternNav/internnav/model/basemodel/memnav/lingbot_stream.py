@@ -52,8 +52,14 @@ _DEFAULT_LINGBOT_WEIGHTS = (
 # --------------------------------------------------------------------------- #
 GROUND_BIAS_CORRECTION = 1.15    # 1/median(s_raw/s_gt), per-frame-median estimator,
                                  # 16 validate_gated 2-leg eps, outlier-excl (2026-07-21)
-GROUND_SCALE_RANGE = (0.8, 4.0)  # validated MP3D true scales lie in [1.5, 3.9]; max good
-                                 # corrected estimate ~3.6, the one floor-miss gives 4.47
+GROUND_SCALE_RANGE = (0.8, 6.0)  # CLAMP bounds for the corrected estimate (ground_scale_from_
+                                 # h_est now clamps, not rejects). RECALIBRATED 2026-07-22 over
+                                 # the full 1919-episode pt1 sweep (diag_ground_scale_sweep.py):
+                                 # old ceiling 4.0 (fit on 16 two-leg eps, [1.5,3.9]) is far below
+                                 # the full set's true-scale median 3.56 / 37% > 4.0. 6.0 leaves
+                                 # ~95.6% untouched; the ~4% above it clamp to 6.0, which beats
+                                 # the old pooled-constant fallback in every band (est in (6,8]:
+                                 # 12% err vs 59%). Only the ceiling ever binds (0 eps hit 0.8).
 
 
 @torch.no_grad()
@@ -164,16 +170,21 @@ def ground_scale_from_h_est(h_est, camera_height_m=0.5,
     2-leg episodes (outlier-excluded; scripts/diag_ground_scale.py, 2026-07-21).
     Residual after correction: ~8% std, range [0.78, 1.09]; the remaining spread is
     dominated by a per-scene depth bias (17DRP ~0.90 vs 1LX ~0.79 raw medians).
-    scale_range: every validated MP3D true scale lies in [1.5, 3.9] and the max
-    good corrected estimate is ~3.6, while the one observed floor-miss
-    (1LXtFkjw3qL/episode_0006) gives 4.47 — out-of-range estimates return None
-    (-> the caller's pooled-constant fallback, which is closer in that failure)."""
+    scale_range: CLAMP the corrected estimate into [lo, hi] (only None if h_est is
+    itself invalid). Changed 2026-07-22 from reject-to-None: over the full 1919-episode
+    pt1 sweep every out-of-range episode hit the UPPER bound, and clamping to the
+    ceiling beat the pooled-constant fallback in every band — est in (6,8] (true s_gt
+    median 6.2): clamp-to-6 err 12% vs constant 59%; est > 8 (degenerate/low-motion,
+    true s_gt median 15): clamp 61% vs constant 83%. The reject-to-constant design
+    assumed out-of-range == floor-miss (est huge, truth ~normal, constant closer), but
+    no such episode exists here — high-est episodes have genuinely high true scale, and
+    the depth estimate tracks it (scripts/diag_ground_scale_sweep.py). Ceiling recalibr-
+    ated to 6.0 (was 4.0). Overridable per run via MEMNAV_GROUND_SCALE_MAX (-> MemNavNet).
+    In practice only the upper bound ever binds (0 episodes hit the 0.8 floor)."""
     if h_est is None or h_est <= 1e-6:
         return None
     s = float(bias_correction * camera_height_m / h_est)
-    if not (scale_range[0] <= s <= scale_range[1]):
-        return None
-    return s
+    return float(min(max(s, scale_range[0]), scale_range[1]))     # clamp, not reject
 
 
 class LingBotStream(nn.Module):

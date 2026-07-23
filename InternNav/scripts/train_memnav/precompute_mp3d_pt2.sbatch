@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=lingbot_precompute_pt1
-#SBATCH --output=/scratch/lg154/Research/Nav/InternNav/logs/mp3d_gen/precomp-%A_%a.out
-#SBATCH --error=/scratch/lg154/Research/Nav/InternNav/logs/mp3d_gen/precomp-%A_%a.err
+#SBATCH --job-name=lingbot_precompute_pt2
+#SBATCH --output=/scratch/lg154/Research/Nav/InternNav/logs/mp3d_gen/precomp2-%A_%a.out
+#SBATCH --error=/scratch/lg154/Research/Nav/InternNav/logs/mp3d_gen/precomp2-%A_%a.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -12,33 +12,26 @@
 #SBATCH --gres=gpu:1
 #SBATCH --export=ALL
 #
-# Precompute frozen LingBot-Map KV caches for the PACKED mp3d 0-53 scenes.
-# Frames live in a read-only squashfs (pt1.sqf). We mount it the NYU-supported way:
-#   apptainer exec --overlay pt1.sqf:ro <base.sif>
+# Precompute frozen LingBot-Map KV caches for the PACKED mp3d 54-89 scenes.
+# Frames live in a read-only squashfs (pt2.sqf). We mount it the NYU-supported way:
+#   apptainer exec --overlay pt2.sqf:ro <base.sif>
 # Inside the container the tree appears at /mp3d_revisit_v0/vln_n1/traj_data (that is how the
 # image was packed with -keep-as-directory). We READ frames from there and WRITE caches to a
 # SEPARATE writable tree on host /scratch (--out_root), which is bind-mounted rw (the overlay
 # is :ro, so writes land on the real filesystem, not the image).
-# --cam_only refresh (raw frames UNCHANGED — post cam-facing fix 04ab675, no regen). The Jul-12
-# lingbot_cache.npz (dino_cls + anchor_k/v) depends only on the frames + model, NOT on the new
-# ground scale, so it is still valid and is left untouched. We only rewrite the small cam cache
-# to inject the whole-episode ground_h_est used by scale_mode='ground' (added 5e46781, absent
-# from the Jul-12 cam caches):
-#   lingbot_cam_cache.npz  cam_k/v + cam_pose_enc + ground_h_est   (written always, line ~438)
-# --skip_scale is inert under --cam_only (scale KV path is skipped) but kept for clarity.
-# ground_h_est (scale_mode='ground') is ON by default; pass --skip_ground_scale to disable.
-# --overwrite replaces the stale cam caches sitting at these paths in the feature tree.
-# NOTE: 25 long 3-leg episodes (>2048 frames, up to 3954) exceed --max_frame_num 2048 and crash
-# the RoPE slice, so they are intentionally SKIPPED (Option B) — they get no cache at all and are
-# simply dropped from training. To include them one day, bump --max_frame_num to 4096 (Option A).
+# --cam_only --overwrite rewrites ONLY lingbot_cam_cache.npz (cam_k/v + cam_pose_enc), now
+# including the whole-episode ground_h_est used by scale_mode='ground' (added 5e46781, absent
+# from the Jul-12 caches). The expensive full cache (lingbot_cache.npz: dino_cls + anchor_k/v)
+# is left untouched. --overwrite is required because the stale cam caches already exist and must
+# be replaced; drop it for later gap-fills once every traj has a ground_h_est cam cache.
 #
 # NOTE for training later: run training inside the SAME overlay so rgb paths resolve, i.e.
 #   root_dirs=/mp3d_revisit_v0/vln_n1/traj_data  (in-container overlay path)
 #   feature_root=/scratch/lg154/Research/datasets/mp3d_revisit_v0_feat/vln_n1/traj_data (host)
 #
 # Submit (from InternNav/, or with the full path shown):
-#   smoke (2 trajs, 1 shard):  sbatch --array=0 --export=ALL,NUM_SHARDS=1,LIMIT=2 scripts/train_memnav/precompute_mp3d_pt1.sbatch
-#   full  (8-way shard):       sbatch --array=0-7%8 --export=ALL,NUM_SHARDS=8 scripts/train_memnav/precompute_mp3d_pt1.sbatch
+#   smoke (2 trajs, 1 shard):  sbatch --array=0 --export=ALL,NUM_SHARDS=1,LIMIT=2 scripts/train_memnav/precompute_mp3d_pt2.sbatch
+#   full  (8-way shard):       sbatch --array=0-7%8 --export=ALL,NUM_SHARDS=8 scripts/train_memnav/precompute_mp3d_pt2.sbatch
 # With --overwrite this pass rewrites every cam cache (the point: back-fill ground_h_est). Once
 # complete, remove --overwrite in the python call below to restore skip-if-exists gap-filling.
 set -euo pipefail
@@ -47,7 +40,7 @@ export NUM_SHARDS="${NUM_SHARDS:-1}"
 export LIMIT="${LIMIT:-0}"
 export SHARD="${SLURM_ARRAY_TASK_ID:-0}"
 
-IMG=/scratch/lg154/Research/datasets/_overlays/mp3d_revisit_v0_pt1.sqf
+IMG=/scratch/lg154/Research/datasets/_overlays/mp3d_revisit_v0_pt2.sqf
 BASE_SIF=/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif
 export ROOT_DIRS=/mp3d_revisit_v0/vln_n1/traj_data                      # in-container overlay path
 export OUT_ROOT=/scratch/lg154/Research/datasets/mp3d_revisit_v0_feat/vln_n1/traj_data
