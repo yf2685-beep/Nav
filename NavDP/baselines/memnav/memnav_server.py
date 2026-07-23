@@ -1,85 +1,101 @@
-"""MemNav Flask server — same HTTP contract as the other NavDP baselines.
+"""MemNav Flask server — the model half of the two-process closed-loop eval.
 
-Endpoints:
-  POST /navigator_reset      json{intrinsic, stop_threshold, batch_size} -> build/reset agent
-  POST /navigator_reset_env  json{env_id}                                -> reset one env buffer
-  POST /imagegoal_step       files{image, goal, depth}                   -> {trajectory,...}
+Runs in the `memnav` conda env. The Habitat client (habitat env) streams RGB
+frames over HTTP; this server maintains the live LingBot memory and plans
+trajectories toward a goal image on request.
 
-Run in the `enerverse` env:
-  python memnav_server.py --port 8888 \
-      --checkpoint <memnav.ckpt> \
-      --lingbot_repo /home/nyuair/yuxuan/lingbot-map \
-      --lingbot_weights /home/nyuair/yuxuan/lingbot-map/weights/lingbot-map-long.pt
+Endpoints (NavDP wire-contract style):
+  POST /navigator_reset      JSON {camera_height?, stop_threshold?, batch_size?}
+                             -> {"algo": "memnav"}   (starts a fresh episode)
+  POST /memory_step          files: image (jpg)      -> {"frame_idx": i}
+                             stream a frame into memory WITHOUT planning (leg replay)
+  POST /imagegoal_step       files: image (jpg), goal (jpg)
+                             -> {"trajectory": [24,3] metres (x fwd, y left, theta),
+                                 "all_trajectory": [N,24,3], "all_values": [N],
+                                 "gate": float, "match_idx": int, "frame_idx": int}
+                             streams the frame, then plans toward the goal.
+
+Usage:
+  conda activate memnav
+  python memnav_server.py --port 18888 \
+    --checkpoint /home/asus/Research/Nav/InternNav/checkpoints/memnav_2leg_axisfix/checkpoint-1500/memnav.ckpt
 """
+
 import argparse
-import sys
+import os
 
-import numpy as np
+# must precede any torch import (policy_agent): reduces fragmentation OOMs from
+# the large KV-cache alloc/free cycle each plan() runs.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from flask import Flask, jsonify, request
-from PIL import Image
 
-sys.path.insert(0, "/home/nyuair/yuxuan/lingbot-map")
-from policy_agent import MemNav_Agent
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int, default=18888)
+parser.add_argument("--checkpoint", type=str, required=True)
+parser.add_argument("--internnav_root", type=str,
+                    default="/home/asus/Research/Nav/InternNav")
+parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--num_samples", type=int, default=16)
+parser.add_argument("--exclude_recent", type=int, default=83,
+                    help="retrieval candidate gap (dataset default)")
+parser.add_argument("--retrieval", choices=["head", "raw"], default="raw",
+                    help="match selector: trained projection vs raw dino-cls cosine")
+parser.add_argument("--gate_skip_below", type=float, default=0.0,
+                    help="skip the goal-insert tower when trained gate < this (0 = never skip)")
+parser.add_argument("--anchor_switch_margin", type=float, default=0.01,
+                    help="sticky-anchor ratchet: switch match only on a clear score win")
+parser.add_argument("--buffer_root", type=str, default="/tmp/memnav_server_buffer")
+args = parser.parse_args()
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+from policy_agent import MemNavAgent  # noqa: E402  (after chdir so lingbot paths resolve)
+
+agent = MemNavAgent(
+    checkpoint=args.checkpoint,
+    internnav_root=args.internnav_root,
+    device=args.device,
+    exclude_recent=args.exclude_recent,
+    num_samples=args.num_samples,
+    buffer_root=args.buffer_root,
+    gate_skip_below=args.gate_skip_below,
+    retrieval_mode=args.retrieval,
+    anchor_switch_margin=args.anchor_switch_margin,
+)
 
 app = Flask(__name__)
-memnav = None
-args = None
 
 
 @app.route("/navigator_reset", methods=["POST"])
-def memnav_reset():
-    # NOTE: the agent (incl. the frozen LingBot) is built ONCE in the main thread at
-    # startup — NOT here. Building/running CUDA + flash-attn/xformers inside a Flask
-    # worker thread crashes the process silently (no traceback). Here we only reset state.
-    intrinsic = np.array(request.get_json().get("intrinsic"))
-    threshold = np.array(request.get_json().get("stop_threshold"))
-    batchsize = int(np.array(request.get_json().get("batch_size")))
-    memnav.intrinsic = intrinsic
-    memnav.reset(batchsize, threshold)
+def navigator_reset():
+    payload = request.get_json(silent=True) or {}
+    cam_h = float(payload.get("camera_height", 0.5))
+    agent.reset(camera_height=cam_h)
     return jsonify({"algo": "memnav"})
 
 
 @app.route("/navigator_reset_env", methods=["POST"])
-def memnav_reset_env():
-    memnav.reset_env(int(request.get_json().get("env_id")))
+def navigator_reset_env():
+    # single-env server: same as a full reset (used by the cold/reset-memory arm)
+    agent.reset(camera_height=agent.camera_height)
     return jsonify({"algo": "memnav"})
 
 
-@app.route("/imagegoal_step", methods=["POST"])
-def memnav_imagegoal_step():
-    B = memnav.batch_size
-    # current RGB (concat over envs -> [B,H,W,3])
-    image = np.asarray(Image.open(request.files["image"].stream).convert("RGB"))
-    image = image.reshape((B, -1, image.shape[1], 3))
-    # goal RGB
-    goal = np.asarray(Image.open(request.files["goal"].stream).convert("RGB"))
-    goal = goal.reshape((B, -1, goal.shape[1], 3))
+@app.route("/memory_step", methods=["POST"])
+def memory_step():
+    idx = agent.add_frame(request.files["image"].read())
+    return jsonify({"frame_idx": idx})
 
-    exec_traj, all_traj, all_values = memnav.step_imagegoal(goal, image)
-    return jsonify({
-        "trajectory": exec_traj.tolist(),
-        "all_trajectory": all_traj.tolist(),
-        "all_values": all_values.tolist(),
-    })
+
+@app.route("/imagegoal_step", methods=["POST"])
+def imagegoal_step():
+    agent.add_frame(request.files["image"].read())
+    out = agent.plan(request.files["goal"].read())
+    return jsonify(out)
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8888)
-    ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--lingbot_repo", default="/home/nyuair/yuxuan/lingbot-map")
-    ap.add_argument("--lingbot_weights",
-                    default="/home/nyuair/yuxuan/lingbot-map/weights/lingbot-map-long.pt")
-    ap.add_argument("--sample_num", type=int, default=4)
-    ap.add_argument("--device", default="cuda:0")
-    args = ap.parse_args()
-    # Build the agent (frozen LingBot + trained heads) ONCE, in the MAIN thread, before
-    # serving. Building/running it inside a Flask worker thread crashed the process silently.
-    memnav = MemNav_Agent(
-        np.eye(3), checkpoint=args.checkpoint,
-        lingbot_repo=args.lingbot_repo, lingbot_weights=args.lingbot_weights,
-        predict_size=24, sample_num=args.sample_num, device=args.device)
-    memnav.reset(1)
-    print("[memnav_server] agent ready — serving.", flush=True)
-    # Match the working navdp/logoplanner servers: default threading, localhost.
-    app.run(host="127.0.0.1", port=args.port)
+    print(f"[memnav_server] ready on :{args.port} "
+          f"(W={agent.W}, S={agent.S}, amargin={agent.amargin}, "
+          f"exclude_recent={agent.exclude_recent}, samples={agent.num_samples})")
+    app.run(host="0.0.0.0", port=args.port, threaded=False)

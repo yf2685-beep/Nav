@@ -41,6 +41,140 @@ _DEFAULT_LINGBOT_WEIGHTS = (
     "/home/asus/Research/Nav/NavDP/baselines/memnav/lingbot-map/weights/lingbot-map-long.pt"
 )
 
+# --------------------------------------------------------------------------- #
+# Ground-anchored metric scale — shared helpers.
+# Single source of truth for the floor-histogram scale recovery, used by
+#   * LingBotStream.compute_metric_scale (on-the-fly fallback at train time), and
+#   * scripts/dataset_converters/precompute_lingbot_features.py, which pools the
+#     SAME estimate over the whole episode during its continuous stream and stores
+#     ``ground_h_est`` in lingbot_cam_cache.npz (zero train-time cost).
+# See compute_metric_scale's docstring for the method + validation numbers.
+# --------------------------------------------------------------------------- #
+GROUND_BIAS_CORRECTION = 1.15    # 1/median(s_raw/s_gt), per-frame-median estimator,
+                                 # 16 validate_gated 2-leg eps, outlier-excl (2026-07-21)
+GROUND_SCALE_RANGE = (0.8, 4.0)  # validated MP3D true scales lie in [1.5, 3.9]; max good
+                                 # corrected estimate ~3.6, the one floor-miss gives 4.47
+
+
+@torch.no_grad()
+def ground_frame_heights(depth, conf, pose9, conf_quantile=0.5, pixel_stride=4):
+    """Unproject depth into the map frame and return PER-FRAME-RELATIVE floor
+    candidate heights: each point's map-frame +y-down height minus ITS OWN frame's
+    camera height. Relative heights are what make the estimate correct on
+    multi-level scenes — the capture camera is a fixed height above the LOCAL
+    floor, while absolute map heights differ per level (validated failure:
+    1LXtFkjw3qL's split-level episodes, up to 0.6 m GT camera-z spread).
+
+      depth, conf : [F, H, W] on device (full depth head output, lingbot units)
+      pose9       : [F, 9] absT+quaR(cam-to-world)+FoV for exactly these frames
+    Returns (rel_heights [N], frame_of [N] long) for conf-filtered valid points."""
+    from lingbot_map.utils.rotation import quat_to_mat
+    pose = pose9.to(depth.device, torch.float32)
+    R = quat_to_mat(torch.nn.functional.normalize(pose[:, 3:7], dim=-1))  # [F,3,3] c2w
+    t = pose[:, :3]
+    F_, H, W = depth.shape
+    fy = (H / 2.0) / torch.tan(pose[:, 7] / 2.0)
+    fx = (W / 2.0) / torch.tan(pose[:, 8] / 2.0)
+    vs = torch.arange(0, H, pixel_stride, device=depth.device, dtype=torch.float32)
+    us = torch.arange(0, W, pixel_stride, device=depth.device, dtype=torch.float32)
+    v, u = torch.meshgrid(vs, us, indexing="ij")
+    d = depth[:, ::pixel_stride, ::pixel_stride]                     # [F, h, w]
+    c = conf[:, ::pixel_stride, ::pixel_stride]
+    x = (u[None] - W / 2.0) * d / fx[:, None, None]
+    y = (v[None] - H / 2.0) * d / fy[:, None, None]
+    p_cam = torch.stack([x, y, d], -1)                               # [F, h, w, 3]
+    p_world = torch.einsum("fij,fhwj->fhwi", R, p_cam) + t[:, None, None, :]
+    rel = p_world[..., 1] - t[:, 1, None, None]                      # minus own cam_y
+    # per-frame conf quantile: conf is a relative uncertainty, not calibrated across frames
+    keep = (d > 1e-6) & (c >= torch.quantile(
+        c.reshape(F_, -1), conf_quantile, dim=1)[:, None, None])
+    frame_of = torch.arange(F_, device=depth.device)[:, None, None].expand_as(rel)
+    return rel[keep], frame_of[keep]
+
+
+@torch.no_grad()
+def _frame_floor_peak(below, nbins, peak_thresh):
+    """One frame's below-camera relative heights -> its floor distance, or None.
+    Floor = the DEEPEST peak whose (3-bin smoothed) count clears ``peak_thresh`` of
+    the max: the floor is the lowest real surface in view, but at a low mount
+    furniture can out-vote it (global argmax was 77x off once); q99 clips
+    through-window/reflection points that would fool the deepest rule."""
+    hi = torch.quantile(below, 0.99)
+    if not torch.isfinite(hi) or hi <= 1e-6:
+        return None
+    edges = torch.linspace(0.0, float(hi), nbins + 1)
+    counts = torch.histogram(below.float().cpu(), bins=edges).hist
+    smooth = torch.nn.functional.avg_pool1d(counts[None, None], 3, stride=1,
+                                            padding=1, count_include_pad=False)[0, 0]
+    cand = (smooth >= peak_thresh * smooth.max()).nonzero().flatten()
+    peak = int(cand.max())
+    lo_e, hi_e = edges[max(0, peak - 1)].item(), edges[min(nbins, peak + 2)].item()
+    band = below[(below >= lo_e) & (below <= hi_e)]
+    if band.numel() < 50:
+        return None
+    return float(band.median())
+
+
+@torch.no_grad()
+def ground_h_est_from_heights(rel_heights, frame_of, nbins=60, peak_thresh=0.3,
+                              min_frame_points=500):
+    """PER-FRAME floor estimates -> episode camera-to-floor distance (lingbot units).
+
+      rel_heights : [N] per-frame-relative +y-down heights (ground_frame_heights)
+      frame_of    : [N] the frame index of each point
+    Each frame with enough below-camera points contributes its own deepest-peak
+    floor estimate; the episode h_est is the MEDIAN over frames. The median (of
+    frames, not pooled points) is what makes this robust to multi-level scenes
+    (balcony frames overlooking a lower floor), furniture-dominated frames, and
+    slow map-scale drift — each is a minority of frames.
+    Returns (h_est float | None, dbg dict)."""
+    rel_heights = rel_heights.cpu()
+    frame_of = frame_of.cpu()
+    n_frames = int(frame_of.max()) + 1 if frame_of.numel() else 0
+    dbg = dict(n_points=int(rel_heights.numel()), n_frames=n_frames,
+               n_valid=0, h_est=None, h_iqr=None)
+    below_mask = rel_heights > 1e-6
+    h_list = []
+    for f in range(n_frames):
+        below = rel_heights[below_mask & (frame_of == f)]
+        if below.numel() < min_frame_points:
+            continue
+        h_f = _frame_floor_peak(below, nbins, peak_thresh)
+        if h_f is not None:
+            h_list.append(h_f)
+    dbg["n_valid"] = len(h_list)
+    if len(h_list) < max(3, n_frames // 8):
+        return None, dbg
+    h = torch.tensor(h_list)
+    h_est = float(h.median())
+    dbg["h_est"] = h_est
+    dbg["h_iqr"] = float(torch.quantile(h, 0.75) - torch.quantile(h, 0.25))
+    if h_est <= 1e-6:
+        return None, dbg
+    return h_est, dbg
+
+
+def ground_scale_from_h_est(h_est, camera_height_m=0.5,
+                            bias_correction=GROUND_BIAS_CORRECTION,
+                            scale_range=GROUND_SCALE_RANGE):
+    """h_est (lingbot units) -> metric scale multiplier, or None if implausible.
+    bias_correction: the raw per-frame-median estimate carries a consistent
+    underestimate (deepest-peak rule + depth-head far bias make h_est ~13% too
+    deep) — fit as 1/median(s_raw/s_gt_umeyama)=1/0.868 over the 16 validate_gated
+    2-leg episodes (outlier-excluded; scripts/diag_ground_scale.py, 2026-07-21).
+    Residual after correction: ~8% std, range [0.78, 1.09]; the remaining spread is
+    dominated by a per-scene depth bias (17DRP ~0.90 vs 1LX ~0.79 raw medians).
+    scale_range: every validated MP3D true scale lies in [1.5, 3.9] and the max
+    good corrected estimate is ~3.6, while the one observed floor-miss
+    (1LXtFkjw3qL/episode_0006) gives 4.47 — out-of-range estimates return None
+    (-> the caller's pooled-constant fallback, which is closer in that failure)."""
+    if h_est is None or h_est <= 1e-6:
+        return None
+    s = float(bias_correction * camera_height_m / h_est)
+    if not (scale_range[0] <= s <= scale_range[1]):
+        return None
+    return s
+
 
 class LingBotStream(nn.Module):
     def __init__(
@@ -265,6 +399,102 @@ class LingBotStream(nn.Module):
                           for i in range(self.depth)]).contiguous()
         self.model.clean_kv_cache()
         return sk, sv
+
+    # ------------------------------------------------------------------ #
+    # ground-anchored per-trajectory METRIC scale (VGP-Nav sec III-E)
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def compute_metric_scale(self, rgb_paths, cam_pose_enc, camera_height_m=0.5,
+                             conf_quantile=0.5, pixel_stride=4, nbins=60,
+                             n_frames=64, peak_thresh=0.3,
+                             bias_correction=GROUND_BIAS_CORRECTION,
+                             scale_range=GROUND_SCALE_RANGE, return_debug=False):
+        """Recover the per-trajectory metric scale from LingBot's own geometry by
+        anchoring the floor it reconstructs to the known camera mount height
+        (VGP-Nav, arXiv:2606.09268 sec III-E "Ground-Anchored Scale Recovery").
+
+        Streams the first ``num_scale`` frames as one bidirectional block (the exact
+        stream that defines the trajectory's map frame — same as compute_scale_kv),
+        then keeps streaming one frame at a time up to ``n_frames`` (the same
+        continuous causal stream precompute runs, so the poses in ``cam_pose_enc``
+        apply verbatim) — a single viewpoint often barely sees the floor, and pooling
+        ~64 frames is what makes the floor peak dominant (VGP-Nav likewise anchors a
+        multi-view reconstruction, not one snapshot). The FULL frozen depth head runs
+        on each frame's tokens; points are unprojected into the map frame and the
+        floor is the deepest significant peak of the pooled height histogram:
+
+            scale = camera_height_m / (floor_y_peak - median(camera_y))
+
+        Map-frame conventions this relies on (both validated for this checkpoint by
+        scripts/diag_ground_scale.py): pose9 absT/quaR decode as CAM-TO-WORLD, and
+        the map frame is the frame-0 OpenCV camera frame (y points DOWN), so the
+        floor sits at y > camera_y and gravity is +y whenever the capture camera is
+        level (true for the MP3D generator: pitch 0, fixed mount).
+
+          rgb_paths      : >= num_scale frame paths of the trajectory (first ones used)
+          cam_pose_enc   : [>=num_scale, 9] the trajectory's continuous-stream poses
+                           (lingbot_cam_cache.npz), frames aligned with rgb_paths
+          camera_height_m: true mount height (gen_meta.json camera_height_m; 0.5 default)
+        Returns float scale (multiply LingBot translations by it to get meters), or
+        None if too few confident floor points were found (caller falls back to the
+        pooled constant)."""
+        S = self.num_scale
+        n = max(S, min(n_frames, len(rgb_paths)))
+        imgs = self._preprocess(
+            rgb_paths[:n], mode="pad",
+            image_size=self.img_size, patch_size=self.patch_size,
+        )                                                    # [n, 3, H, W] (cpu)
+
+        self.model.clean_kv_cache()
+        depths, confs = [], []
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            # scale block (defines the map frame), then continuous per-frame stream —
+            # mirrors precompute's extract_trajectory, so cam_pose_enc[i] is frame i's
+            # pose for exactly this stream (sliding-window eviction handled internally)
+            blk = imgs[:S][None].to(self.device)
+            agg, psi = self.model._aggregate_features(
+                blk, num_frame_for_scale=S, num_frame_per_block=S)
+            pred = self.model._predict_depth(agg, blk, psi)  # full head, fp32 inside
+            depths.append(pred["depth"][0, ..., 0].float()); confs.append(pred["depth_conf"][0].float())
+            for j in range(S, n):
+                fj = imgs[j:j + 1][None].to(self.device)
+                a, _ = self.model._aggregate_features(
+                    fj, num_frame_for_scale=S, num_frame_per_block=1)
+                pj = self.model._predict_depth(a, fj, psi)
+                depths.append(pj["depth"][0, ..., 0].float()); confs.append(pj["depth_conf"][0].float())
+        self.model.clean_kv_cache()
+        depth = torch.cat(depths)                            # [n, H, W]  (lingbot units)
+        conf = torch.cat(confs)                              # [n, H, W]
+
+        pose = (cam_pose_enc[:n] if torch.is_tensor(cam_pose_enc)
+                else torch.as_tensor(np.asarray(cam_pose_enc)[:n]))
+        rel_heights, frame_of = ground_frame_heights(depth, conf, pose,
+                                                     conf_quantile=conf_quantile,
+                                                     pixel_stride=pixel_stride)
+        h_est, dbg = ground_h_est_from_heights(rel_heights, frame_of, nbins=nbins,
+                                               peak_thresh=peak_thresh)
+        s = ground_scale_from_h_est(h_est, camera_height_m,
+                                    bias_correction=bias_correction,
+                                    scale_range=scale_range)
+        return (s, dbg) if return_debug else s
+
+    def get_metric_scale(self, rgb_dir, cam_pose_enc, camera_height_m=0.5):
+        """Per-trajectory cached :meth:`compute_metric_scale`, keyed by ``rgb_dir``.
+        Scalars only, so the cache is unbounded (a float per trajectory seen).
+        Failures (None) are cached too — a floorless first block stays floorless."""
+        if not hasattr(self, "_metric_scale_cache"):
+            self._metric_scale_cache = {}
+        if rgb_dir in self._metric_scale_cache:
+            return self._metric_scale_cache[rgb_dir]
+        paths = []
+        for i in range(min(64, len(cam_pose_enc))):   # pooled-histogram frame budget
+            p = os.path.join(rgb_dir, f"{i}.jpg")
+            if not os.path.isfile(p):
+                break
+            paths.append(p)
+        s = self.compute_metric_scale(paths, cam_pose_enc, camera_height_m)
+        self._metric_scale_cache[rgb_dir] = s
+        return s
 
     def get_scale_kv(self, rgb_dir):
         """LRU-cached :meth:`compute_scale_kv` keyed by ``rgb_dir`` (trajectory

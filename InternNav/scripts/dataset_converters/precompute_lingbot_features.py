@@ -157,7 +157,8 @@ def build_model(args, device):
 # Per-trajectory KV-cache + CLS capture
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False, skip_scale=False):
+def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False, skip_scale=False,
+                       ground_helpers=None, ground_stride=1):
     """Stream `images` [1, S, 3, H, W] through the aggregator + camera head,
     capturing per-frame KV caches (and the DINOv2 CLS token).
 
@@ -178,6 +179,19 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     The camera head is run via a direct ``camera_head(...)`` call right after each
     ``_aggregate_features`` (it manages its own frame_idx + KV cache); this avoids the
     depth/world-point heads that the full ``forward`` would also run.
+
+    Ground-anchored metric scale (``ground_helpers`` = the pair
+    ``(ground_frame_heights, ground_h_est_from_heights)`` from internnav's
+    lingbot_stream module): additionally run the FULL depth head on each streamed
+    frame's tokens (every ``ground_stride``-th frame; ~10-15 ms/frame on top of a
+    stream that already runs the aggregator anyway), unproject with the frame's own
+    just-captured pose, and pool a WHOLE-EPISODE floor-height histogram. Saves
+      * ``ground_h_est``  scalar — estimated camera-to-floor distance in lingbot map
+            units (median of per-frame deepest-peak estimates — robust to
+            multi-level scenes / balcony views / furniture frames / scale drift;
+            NaN if too few frames saw a confident floor). Training turns it into
+            the metric scale via ground_scale_from_h_est(h_est, camera_height_m).
+      * ``ground_dbg``    [n_points, n_frames, n_valid, h_iqr] float32.
     """
     B, S = images.shape[0], images.shape[1]
     assert B == 1
@@ -218,6 +232,16 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
         return ks.permute(3, 0, 1, 2, 4).contiguous(), vs.permute(3, 0, 1, 2, 4).contiguous()
 
     cam_k_list, cam_v_list, cam_pose_list = [], [], []
+    gs_heights, gs_frames, gs_off = [], [], [0]
+
+    def pool_ground(agg_tokens, frame_imgs, pose9):
+        """Depth head on the just-streamed frame(s) -> per-frame-relative floor
+        candidate heights (cpu), frame indices offset to be episode-global."""
+        gfh = ground_helpers[0]
+        dp = model._predict_depth(agg_tokens, frame_imgs, psi)   # fp32 inside
+        rel, fo = gfh(dp["depth"][0, ..., 0].float(), dp["depth_conf"][0].float(), pose9)
+        gs_heights.append(rel.cpu()); gs_frames.append((fo + gs_off[0]).cpu())
+        gs_off[0] += pose9.shape[0]
 
     # Phase 1: scale frames as a single bidirectional block.
     scale_imgs = images[:, :scale].to(dev, non_blocking=True)
@@ -225,6 +249,8 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     pl = ch(scale_agg, causal_inference=True, num_frame_per_block=scale, num_frame_for_scale=scale)
     cam_pose_list.append(pl[-1][0].float().cpu())            # [scale, 9]
     ck, cv = read_cam_newest(scale); cam_k_list.append(ck); cam_v_list.append(cv)
+    if ground_helpers is not None:
+        pool_ground(scale_agg, scale_imgs, pl[-1][0].float())
     if not cam_only:
         cls_list.append(pop_cls(scale))
         if not skip_scale:
@@ -238,6 +264,8 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
         pl = ch(agg_tok, causal_inference=True, num_frame_per_block=1, num_frame_for_scale=scale)
         cam_pose_list.append(pl[-1][0].float().cpu())        # [1, 9]
         ck, cv = read_cam_newest(1); cam_k_list.append(ck); cam_v_list.append(cv)
+        if ground_helpers is not None and (i - scale) % ground_stride == 0:
+            pool_ground(agg_tok, frame, pl[-1][0].float())
         if not cam_only:
             cls_list.append(pop_cls(1))
             ak, av = read_cache_anchor_newest(psi)
@@ -251,6 +279,12 @@ def extract_trajectory(model, images, scale_frames, dino_capture, cam_only=False
     out = {"cam_k": cam_k, "cam_v": cam_v,
            "cam_pose_enc": torch.cat(cam_pose_list, 0).numpy(),   # [S, 9]
            "cam_meta": np.array([NI, TD, Hh, d], dtype=np.int64)}
+    if ground_helpers is not None:
+        h_est, gdbg = ground_helpers[1](torch.cat(gs_heights), torch.cat(gs_frames))
+        out["ground_h_est"] = np.float32(h_est if h_est is not None else np.nan)
+        out["ground_dbg"] = np.array([gdbg["n_points"], gdbg["n_frames"], gdbg["n_valid"],
+                                      gdbg["h_iqr"] if gdbg["h_iqr"] is not None else np.nan],
+                                     dtype=np.float32)
     if cam_only:
         return out
 
@@ -307,6 +341,12 @@ def main():
                     help="Skip writing scale_k/scale_v (~1.08 GB/traj). Training recomputes them "
                          "on the fly from the first num_scale RGB frames via "
                          "LingBotStream.get_scale_kv (LRU-cached).")
+    ap.add_argument("--skip_ground_scale", action="store_true",
+                    help="Skip the whole-episode ground-anchored scale estimate "
+                         "(ground_h_est in the cam cache; adds one depth-head forward "
+                         "per ground_stride-th frame, ~10-15 ms each).")
+    ap.add_argument("--ground_stride", type=int, default=1,
+                    help="Pool floor heights from every Nth streamed frame.")
     ap.add_argument("--overwrite", action="store_true",
                     help="Recompute even if the output npz already exists.")
     ap.add_argument("--limit", type=int, default=0,
@@ -320,6 +360,21 @@ def main():
 
     sys.path.insert(0, args.lingbot_repo)
     from lingbot_map.utils.load_fn import load_and_preprocess_images
+
+    ground_helpers = None
+    if not args.skip_ground_scale:
+        # Load the shared floor-histogram helpers from the module FILE (not the
+        # internnav package — its __init__ pulls training deps this torch-2.8
+        # lingbot env doesn't have). The helpers only need torch/np here;
+        # lingbot_map.utils.rotation is imported lazily at call time (on sys.path).
+        import importlib.util
+        _ls_path = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "../../internnav/model/basemodel/memnav/lingbot_stream.py"))
+        _spec = importlib.util.spec_from_file_location("_lingbot_stream_helpers", _ls_path)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        ground_helpers = (_mod.ground_frame_heights, _mod.ground_h_est_from_heights)
 
     device = torch.device(args.device)
     autocast_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
@@ -372,6 +427,7 @@ def main():
                 feats = extract_trajectory(
                     model, images, args.num_scale_frames, dino_capture,
                     cam_only=args.cam_only, skip_scale=args.skip_scale,
+                    ground_helpers=ground_helpers, ground_stride=args.ground_stride,
                 )
             assert np.isfinite(feats["cam_k"]).all(), "non-finite cam_k"
             # Camera-head cache (always) — small; np.savez (ZIP_STORED) avoids slow deflate.
@@ -380,7 +436,10 @@ def main():
             # timeout, OOM) leaves only a .tmp the skip-if-exists gate ignores — never a
             # truncated final cache that would be silently treated as "done".
             _atomic_savez(cam_path, cam_k=feats["cam_k"], cam_v=feats["cam_v"],
-                          cam_pose_enc=feats["cam_pose_enc"], cam_meta=feats["cam_meta"])
+                          cam_pose_enc=feats["cam_pose_enc"], cam_meta=feats["cam_meta"],
+                          **({"ground_h_est": feats["ground_h_est"],
+                              "ground_dbg": feats["ground_dbg"]}
+                             if "ground_h_est" in feats else {}))
             if not args.cam_only:
                 assert np.isfinite(feats["dino_cls"]).all(), "non-finite dino_cls"
                 save_kwargs = dict(
