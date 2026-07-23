@@ -59,7 +59,9 @@ if PROJECT_ROOT not in sys.path:
 from internnav.model.basemodel.memnav.cache_schema import (
     CACHE_SCHEMA_VERSION,
     DEFAULT_KEYFRAME_BUDGET,
+    FLOW_KEYFRAME_INTERVAL_SENTINEL,
     KEYFRAME_POLICY,
+    KEYFRAME_POLICY_FLOW,
     auto_keyframe_interval,
     validate_cache_files,
 )
@@ -202,6 +204,11 @@ def _git_revision(path):
 
 
 def _resolve_keyframe_interval(args, num_frames):
+    if args.flow_threshold > 0:
+        # Flow-gated selection is causal and per-frame; there is no interval.
+        # The sentinel is stored in the cache so validation knows the indices
+        # are irregular by design, not a corrupted modular cache.
+        return FLOW_KEYFRAME_INTERVAL_SENTINEL
     if args.auto_keyframe_interval:
         return auto_keyframe_interval(num_frames, args.keyframe_budget)
     if args.keyframe_interval < 1:
@@ -222,9 +229,18 @@ def _precompute_provenance(args):
     internnav_revision = _git_revision(PROJECT_ROOT)
     if internnav_revision == "unknown":
         raise RuntimeError(f"InternNav must be inside an auditable git checkout: {PROJECT_ROOT}")
+    flow_gated = args.flow_threshold > 0
+    if flow_gated:
+        keyframe_interval_mode = (
+            f"flow_thr{args.flow_threshold:g}px_gap{args.max_non_keyframe_gap}"
+        )
+    elif args.auto_keyframe_interval:
+        keyframe_interval_mode = f"auto_budget_{args.keyframe_budget}"
+    else:
+        keyframe_interval_mode = f"fixed_{args.keyframe_interval}"
     config = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
-        "keyframe_policy": KEYFRAME_POLICY,
+        "keyframe_policy": KEYFRAME_POLICY_FLOW if flow_gated else KEYFRAME_POLICY,
         "internnav_revision": internnav_revision,
         "precompute_script_sha256": _sha256_file(__file__),
         "cache_schema_sha256": _sha256_file(
@@ -233,11 +249,9 @@ def _precompute_provenance(args):
                 "internnav/model/basemodel/memnav/cache_schema.py",
             )
         ),
-        "keyframe_interval_mode": (
-            f"auto_budget_{args.keyframe_budget}"
-            if args.auto_keyframe_interval
-            else f"fixed_{args.keyframe_interval}"
-        ),
+        "keyframe_interval_mode": keyframe_interval_mode,
+        "flow_threshold": args.flow_threshold,
+        "max_non_keyframe_gap": args.max_non_keyframe_gap,
         "lingbot_revision": lingbot_revision,
         "weights_sha256": weights_sha256,
         "image_size": args.image_size,
@@ -335,6 +349,8 @@ def extract_trajectory(
     keyframe_interval=1,
     ground_helpers=None,
     ground_stride=1,
+    flow_threshold=0.0,
+    max_non_keyframe_gap=30,
 ):
     """Stream `images` [1, S, 3, H, W] through the aggregator + camera head,
     capturing per-frame KV caches (and the DINOv2 CLS token).
@@ -375,15 +391,36 @@ def extract_trajectory(
     assert B == 1
     scale = min(scale_frames, S)
     keyframe_interval = int(keyframe_interval)
-    if keyframe_interval < 1:
-        raise ValueError(
-            f"keyframe_interval must be positive, got {keyframe_interval}"
-        )
-    if keyframe_interval > 1 and not hasattr(model, "_set_skip_append"):
-        raise RuntimeError(
-            "sparse keyframe precompute requires LingBot GCTStream._set_skip_append; "
-            "update LINGBOT_REPO before generating caches"
-        )
+    flow_gated = float(flow_threshold) > 0.0
+    if flow_gated:
+        if keyframe_interval != FLOW_KEYFRAME_INTERVAL_SENTINEL:
+            raise ValueError(
+                "flow-gated selection replaces keyframe_interval; pass the "
+                f"sentinel {FLOW_KEYFRAME_INTERVAL_SENTINEL}, got {keyframe_interval}"
+            )
+        if int(max_non_keyframe_gap) < 1:
+            raise ValueError(
+                f"max_non_keyframe_gap must be positive, got {max_non_keyframe_gap}"
+            )
+        if getattr(model, "depth_head", None) is None:
+            raise RuntimeError(
+                "flow-gated keyframe selection needs the LingBot depth head "
+                "(flow is reprojection parallax from predicted pose + depth)"
+            )
+        # Upstream's flow metric (gct_stream_window): back-project the current
+        # frame's predicted depth, reproject into the last keyframe's camera,
+        # mean pixel displacement.  Rotation-dominant and scale-invariant.
+        from lingbot_map.models.gct_stream_window import _compute_flow_magnitude
+    else:
+        if keyframe_interval < 1:
+            raise ValueError(
+                f"keyframe_interval must be positive, got {keyframe_interval}"
+            )
+        if keyframe_interval > 1 and not hasattr(model, "_set_skip_append"):
+            raise RuntimeError(
+                "sparse keyframe precompute requires LingBot GCTStream._set_skip_append; "
+                "update LINGBOT_REPO before generating caches"
+            )
 
     model.clean_kv_cache()
     dev = next(model.parameters()).device
@@ -440,6 +477,9 @@ def extract_trajectory(
     ck, cv = read_cam_newest(scale); cam_k_list.append(ck); cam_v_list.append(cv)
     if ground_helpers is not None:
         pool_ground(scale_agg, scale_imgs, pl[-1][0].float())
+    # Flow-gate state: the reference pose starts at the last scale frame.
+    last_kf_pose = pl[-1][:, -1:].float()                    # [1, 1, 9] on device
+    last_kf_idx = scale - 1
     if not cam_only:
         cls_list.append(pop_cls(scale))
         if not skip_scale:
@@ -448,14 +488,19 @@ def extract_trajectory(
     # Phase 2: causal streaming, one frame at a time.
     anchor_k_list, anchor_v_list, anchor_frame_indices = [], [], []
     for i in range(scale, S):
-        is_keyframe = (
-            keyframe_interval <= 1
-            or (i - scale) % keyframe_interval == 0
-        )
-        if not is_keyframe:
-            model._set_skip_append(True)
         frame = images[:, i:i + 1].to(dev, non_blocking=True)
-        try:
+        if flow_gated:
+            # Commit-then-drop: forward in normal append mode (one pass — the
+            # frame's own attention is identical whether or not its KV persists),
+            # decide from its predicted pose+depth, and undo the cache writes if
+            # it is not a keyframe.  The undo is O(1): every SDPA dict-cache
+            # update (append AND sliding-window eviction) builds new tensors via
+            # torch.cat/slicing and reassigns dict entries — nothing is mutated
+            # in place — so restoring the pre-forward dict references restores
+            # the exact pre-forward cache state.
+            saved_agg_kv = dict(kv)
+            saved_cam_kv = [dict(dd) for dd in ch.kv_cache]
+            saved_total = agg.total_frames_processed
             agg_tok, _ = model._aggregate_features(
                 frame, num_frame_for_scale=scale, num_frame_per_block=1
             )
@@ -465,9 +510,52 @@ def extract_trajectory(
                 num_frame_per_block=1,
                 num_frame_for_scale=scale,
             )
-        finally:
+            cur_pose = pl[-1][:, -1:].float()                # [1, 1, 9]
+            if i == scale:
+                # First post-scale frame always anchors the gate (official rule;
+                # cache_schema._flow_gate_indices asserts it).
+                is_keyframe = True
+            else:
+                depth = model._predict_depth(
+                    agg_tok, images=frame, patch_start_idx=psi
+                )["depth"].float()                           # [1, 1, H, W, 1]
+                flow = _compute_flow_magnitude(
+                    cur_pose, last_kf_pose, depth, tuple(depth.shape[2:4])
+                )
+                is_keyframe = (
+                    flow > float(flow_threshold)
+                    or (i - last_kf_idx) >= int(max_non_keyframe_gap)
+                )
+            if is_keyframe:
+                last_kf_pose, last_kf_idx = cur_pose, i
+            else:
+                kv.clear(); kv.update(saved_agg_kv)
+                for live, saved in zip(ch.kv_cache, saved_cam_kv):
+                    live.clear(); live.update(saved)
+                # Aggregator time counts memory WRITES (compressed keyframe
+                # timeline) -> rewind.  The camera head's frame_idx counts
+                # frames SEEN (raw timeline) -> deliberately not restored.
+                agg.total_frames_processed = saved_total
+        else:
+            is_keyframe = (
+                keyframe_interval <= 1
+                or (i - scale) % keyframe_interval == 0
+            )
             if not is_keyframe:
-                model._set_skip_append(False)
+                model._set_skip_append(True)
+            try:
+                agg_tok, _ = model._aggregate_features(
+                    frame, num_frame_for_scale=scale, num_frame_per_block=1
+                )
+                pl = ch(
+                    agg_tok,
+                    causal_inference=True,
+                    num_frame_per_block=1,
+                    num_frame_for_scale=scale,
+                )
+            finally:
+                if not is_keyframe:
+                    model._set_skip_append(False)
         cam_pose_list.append(pl[-1][0].float().cpu())        # [1, 9]
         if ground_helpers is not None and (i - scale) % ground_stride == 0:
             # Dense per-frame output like cam_pose_enc — pooled regardless of
@@ -547,6 +635,18 @@ def main():
         "--keyframe_budget", type=int, default=DEFAULT_KEYFRAME_BUDGET,
         help="Temporal-view budget used by --auto_keyframe_interval (official default: 320).",
     )
+    ap.add_argument(
+        "--flow_threshold", type=float, default=0.0,
+        help="Enable flow-gated keyframe selection (>0, pixels): a frame becomes a "
+             "keyframe when its mean reprojection flow vs the last keyframe exceeds "
+             "this threshold. Causal (no dependence on episode length), rotation-"
+             "sensitive, scale-invariant. Mutually exclusive with interval flags.",
+    )
+    ap.add_argument(
+        "--max_non_keyframe_gap", type=int, default=30,
+        help="Flow mode only: force a keyframe after this many consecutive "
+             "non-keyframes (backstop for feature-poor / stationary stretches).",
+    )
     ap.add_argument("--enable_3d_rope", action="store_true", default=True,
                     help="Temporal 3D RoPE (LingBot's intended mode). Needed for goal time-index placement.")
     ap.add_argument("--max_frame_num", type=int, default=4096,
@@ -596,6 +696,22 @@ def main():
         ap.error("--keyframe_interval must be positive")
     if args.keyframe_budget < 1:
         ap.error("--keyframe_budget must be positive")
+    if args.flow_threshold < 0:
+        ap.error("--flow_threshold must be non-negative")
+    if args.max_non_keyframe_gap < 1:
+        ap.error("--max_non_keyframe_gap must be positive")
+    flow_mode = args.flow_threshold > 0
+    if flow_mode:
+        if args.auto_keyframe_interval or args.keyframe_interval != 1:
+            ap.error(
+                "--flow_threshold replaces interval-based selection; drop "
+                "--keyframe_interval/--auto_keyframe_interval"
+            )
+        if args.cam_only:
+            ap.error(
+                "--cam_only cannot reproduce a flow-gated selection (the keyframe "
+                "set is decided during the joint stream); run a full precompute"
+            )
 
     sys.path.insert(0, args.lingbot_repo)
     from lingbot_map.utils.load_fn import load_and_preprocess_images
@@ -640,6 +756,10 @@ def main():
     ) and not hasattr(model, "_set_skip_append"):
         raise RuntimeError(
             "sparse keyframe precompute requires LingBot GCTStream._set_skip_append"
+        )
+    if flow_mode and getattr(model, "depth_head", None) is None:
+        raise RuntimeError(
+            "flow-gated keyframe selection requires the LingBot depth head"
         )
 
     precompute_config_json, precompute_signature = _precompute_provenance(args)
@@ -688,6 +808,12 @@ def main():
                     f"{layout.precompute_signature} != {precompute_signature}; "
                     "use a new out_root rather than mixing precompute runs"
                 )
+            expected_policy = KEYFRAME_POLICY_FLOW if flow_mode else KEYFRAME_POLICY
+            if layout.keyframe_policy != expected_policy:
+                raise RuntimeError(
+                    f"existing cache keyframe policy differs at {dst_dir}: "
+                    f"{layout.keyframe_policy} != {expected_policy}"
+                )
             if layout.keyframe_interval != keyframe_interval:
                 raise RuntimeError(
                     f"existing cache interval differs at {dst_dir}: "
@@ -734,12 +860,29 @@ def main():
                     cam_only=args.cam_only, skip_scale=args.skip_scale,
                     keyframe_interval=keyframe_interval,
                     ground_helpers=ground_helpers, ground_stride=args.ground_stride,
+                    flow_threshold=args.flow_threshold,
+                    max_non_keyframe_gap=args.max_non_keyframe_gap,
+                )
+            if flow_mode:
+                n_kf = int(len(feats["anchor_frame_indices"]))
+                n_streamed = max(0, len(rgb_paths) - min(args.num_scale_frames, len(rgb_paths)))
+                tqdm.write(
+                    f"  flow-gated keyframes: {n_kf}/{n_streamed} "
+                    f"({(100.0 * n_kf / n_streamed) if n_streamed else 0.0:.1f}%) "
+                    f"at thr={args.flow_threshold:g}px gap<={args.max_non_keyframe_gap} "
+                    f"for {os.path.relpath(traj_dir, args.root_dirs)}"
                 )
             for name in ("cam_k", "cam_v", "cam_pose_enc"):
                 assert np.isfinite(feats[name]).all(), f"non-finite {name}"
             shared_metadata = dict(
                 cache_schema_version=np.array([CACHE_SCHEMA_VERSION], dtype=np.int64),
-                keyframe_policy=np.array([KEYFRAME_POLICY]),
+                keyframe_policy=np.array(
+                    [KEYFRAME_POLICY_FLOW if flow_mode else KEYFRAME_POLICY]
+                ),
+                flow_threshold=np.array([float(args.flow_threshold)], dtype=np.float64),
+                max_non_keyframe_gap=np.array(
+                    [int(args.max_non_keyframe_gap)], dtype=np.int64
+                ),
                 num_frames=np.array([len(rgb_paths)], dtype=np.int64),
                 num_scale_frames=np.array(
                     [min(args.num_scale_frames, len(rgb_paths))], dtype=np.int64
@@ -792,6 +935,8 @@ def main():
             if (
                 layout.precompute_signature != precompute_signature
                 or layout.keyframe_interval != keyframe_interval
+                or layout.keyframe_policy
+                != (KEYFRAME_POLICY_FLOW if flow_mode else KEYFRAME_POLICY)
             ):
                 raise RuntimeError("post-write cache metadata validation failed")
             n_done += 1
