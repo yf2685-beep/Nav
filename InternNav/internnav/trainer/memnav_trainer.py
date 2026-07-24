@@ -107,6 +107,12 @@ class MemNavTrainer(BaseTrainer):
             for k, v in logs.items():
                 base = k.split('/')[-1]
                 sectioned[self._WB_TARGET.get(base, f'misc/{base}')] = v
+            # HF's WandbCallback.setup() defines "train/global_step" as the default
+            # x-axis (step_metric) for ALL panels. We no-op'd that callback's on_log,
+            # so it never logs train/global_step -> it stays 0 and every point stacks
+            # at x=0 (charts look like a single point). Re-emit it ourselves; passing
+            # step= only sets wandb's internal _step, which the UI does NOT use as x-axis.
+            sectioned['train/global_step'] = self.state.global_step
             self._wb.log(sectioned, step=self.state.global_step)
         return super().log(logs, *args, **kwargs)
 

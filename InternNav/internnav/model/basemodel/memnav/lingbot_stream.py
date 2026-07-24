@@ -52,8 +52,14 @@ _DEFAULT_LINGBOT_WEIGHTS = (
 # --------------------------------------------------------------------------- #
 GROUND_BIAS_CORRECTION = 1.15    # 1/median(s_raw/s_gt), per-frame-median estimator,
                                  # 16 validate_gated 2-leg eps, outlier-excl (2026-07-21)
-GROUND_SCALE_RANGE = (0.8, 4.0)  # validated MP3D true scales lie in [1.5, 3.9]; max good
-                                 # corrected estimate ~3.6, the one floor-miss gives 4.47
+GROUND_SCALE_RANGE = (0.8, 6.0)  # CLAMP bounds for the corrected estimate (ground_scale_from_
+                                 # h_est now clamps, not rejects). RECALIBRATED 2026-07-22 over
+                                 # the full 1919-episode pt1 sweep (diag_ground_scale_sweep.py):
+                                 # old ceiling 4.0 (fit on 16 two-leg eps, [1.5,3.9]) is far below
+                                 # the full set's true-scale median 3.56 / 37% > 4.0. 6.0 leaves
+                                 # ~95.6% untouched; the ~4% above it clamp to 6.0, which beats
+                                 # the old pooled-constant fallback in every band (est in (6,8]:
+                                 # 12% err vs 59%). Only the ceiling ever binds (0 eps hit 0.8).
 
 
 @torch.no_grad()
@@ -164,16 +170,21 @@ def ground_scale_from_h_est(h_est, camera_height_m=0.5,
     2-leg episodes (outlier-excluded; scripts/diag_ground_scale.py, 2026-07-21).
     Residual after correction: ~8% std, range [0.78, 1.09]; the remaining spread is
     dominated by a per-scene depth bias (17DRP ~0.90 vs 1LX ~0.79 raw medians).
-    scale_range: every validated MP3D true scale lies in [1.5, 3.9] and the max
-    good corrected estimate is ~3.6, while the one observed floor-miss
-    (1LXtFkjw3qL/episode_0006) gives 4.47 — out-of-range estimates return None
-    (-> the caller's pooled-constant fallback, which is closer in that failure)."""
+    scale_range: CLAMP the corrected estimate into [lo, hi] (only None if h_est is
+    itself invalid). Changed 2026-07-22 from reject-to-None: over the full 1919-episode
+    pt1 sweep every out-of-range episode hit the UPPER bound, and clamping to the
+    ceiling beat the pooled-constant fallback in every band — est in (6,8] (true s_gt
+    median 6.2): clamp-to-6 err 12% vs constant 59%; est > 8 (degenerate/low-motion,
+    true s_gt median 15): clamp 61% vs constant 83%. The reject-to-constant design
+    assumed out-of-range == floor-miss (est huge, truth ~normal, constant closer), but
+    no such episode exists here — high-est episodes have genuinely high true scale, and
+    the depth estimate tracks it (scripts/diag_ground_scale_sweep.py). Ceiling recalibr-
+    ated to 6.0 (was 4.0). Overridable per run via MEMNAV_GROUND_SCALE_MAX (-> MemNavNet).
+    In practice only the upper bound ever binds (0 episodes hit the 0.8 floor)."""
     if h_est is None or h_est <= 1e-6:
         return None
     s = float(bias_correction * camera_height_m / h_est)
-    if not (scale_range[0] <= s <= scale_range[1]):
-        return None
-    return s
+    return float(min(max(s, scale_range[0]), scale_range[1]))     # clamp, not reject
 
 
 class LingBotStream(nn.Module):
@@ -186,7 +197,7 @@ class LingBotStream(nn.Module):
         num_scale=8,
         window=8,
         enable_3d_rope=True,
-        max_frame_num=1024,
+        max_frame_num=4096,
         camera_num_iterations=4,
         use_sdpa=True,
         device="cuda",
@@ -296,15 +307,54 @@ class LingBotStream(nn.Module):
     # ------------------------------------------------------------------ #
     # KV-cache injection
     # ------------------------------------------------------------------ #
-    def _inject(self, scale_k, scale_v, anchor_k, anchor_v, n_hist, total_frames):
+    @staticmethod
+    def _prefix_count(frame_indices, raw_frame_exclusive):
+        """Number of sorted sparse KVs whose raw index is before a boundary."""
+        if frame_indices is None:
+            return None
+        if torch.is_tensor(frame_indices):
+            boundary = torch.as_tensor(
+                raw_frame_exclusive,
+                device=frame_indices.device,
+                dtype=frame_indices.dtype,
+            )
+            return int(torch.searchsorted(frame_indices, boundary).item())
+        return int(np.searchsorted(np.asarray(frame_indices), raw_frame_exclusive))
+
+    def _inject(
+        self,
+        scale_k,
+        scale_v,
+        anchor_k,
+        anchor_v,
+        n_hist=None,
+        total_frames=None,
+        *,
+        anchor_frame_indices=None,
+        raw_start=None,
+    ):
         """Populate the SDPA dict cache: scale (full) in k_i, history specials in
         k_i_special. Tensors expected on device, bfloat16.
 
           scale_k/v  : [L, H, num_scale, P, d]
           anchor_k/v : [L, H, n_hist, 6, d]   (history frames [num_scale .. ])
-        Sets total_frames_processed so subsequently-streamed frames get the right
-        temporal index under 3D RoPE.
+        For a versioned sparse cache, ``anchor_frame_indices`` are raw video
+        indices and ``raw_start`` is the first live-recomputed frame.  LingBot's
+        aggregator temporal counter advances only when a KV is appended, so its
+        next index is ``num_scale + number_of_injected_keyframes``.  Legacy dense
+        callers may continue to provide ``n_hist`` and ``total_frames`` directly.
         """
+        if anchor_frame_indices is not None:
+            if raw_start is None:
+                raise ValueError("raw_start is required with anchor_frame_indices")
+            n_hist = self._prefix_count(anchor_frame_indices, int(raw_start))
+            total_frames = self.num_scale + n_hist
+        if n_hist is None or total_frames is None:
+            raise ValueError("cache injection requires history length and temporal index")
+        if not 0 <= int(n_hist) <= int(anchor_k.shape[2]):
+            raise ValueError(
+                f"invalid anchor prefix {n_hist} for {anchor_k.shape[2]} cached rows"
+            )
         self.model.clean_kv_cache()
         kv = self.agg.kv_cache
         for i in range(self.depth):
@@ -315,15 +365,27 @@ class LingBotStream(nn.Module):
                 kv[f"v_{i}_special"] = anchor_v[i, :, :n_hist][None]
         self.agg.total_frames_processed = int(total_frames)
 
-    def _inject_camera(self, cam_k, cam_v, n):
-        """Inject the camera-head KV cache for frames [0..n-1] so the camera head
-        relocalizes a freshly-streamed frame against that history.
-          cam_k/v : [N, NI, TD, H, d] on device (bf16)
-        Sets frame_idx = n (the next streamed frame lands at temporal slot n)."""
+    def _inject_camera(self, cam_k, cam_v, n, cam_frame_indices=None):
+        """Inject camera KVs before raw frame ``n`` and set its raw RoPE time.
+
+        Sparse camera KVs retain their original raw temporal encoding.  Their row
+        count is therefore selected through ``cam_frame_indices < n`` while
+        ``frame_idx`` must still be the raw index ``n``; using the sparse row count
+        as time would silently shift every goal pose.
+        """
         ch = self.model.camera_head
         ch.clean_kv_cache()
         NI, TD = ch.num_iterations, ch.trunk_depth
-        K, V = cam_k[:n], cam_v[:n]                              # [n, NI, TD, H, d]
+        n_cached = (
+            int(n)
+            if cam_frame_indices is None
+            else self._prefix_count(cam_frame_indices, int(n))
+        )
+        if not 0 <= n_cached <= len(cam_k):
+            raise ValueError(
+                f"invalid camera prefix {n_cached} for {len(cam_k)} cached rows"
+            )
+        K, V = cam_k[:n_cached], cam_v[:n_cached]
         cc = []
         for it in range(NI):
             dd = {"_skip_append": False}
@@ -335,13 +397,13 @@ class LingBotStream(nn.Module):
         ch.frame_idx = int(n)
 
     @torch.no_grad()
-    def camera_pose(self, cam_k, cam_v, n, agg_tokens):
+    def camera_pose(self, cam_k, cam_v, n, agg_tokens, cam_frame_indices=None):
         """Absolute camera pose in LingBot's map frame: inject the camera-head cache
         [0..n-1], run the frozen camera head on `agg_tokens` (a frame's aggregated_tokens_list),
         return its accumulated output pose `pred_pose_enc_list[-1]` = [S, 9]
         (absT[3], quaR[4], FoV[2]; the sum of 4 delta-refinement iterations). Current + goal
         poses share the scale-frame anchor → their relative is the revisit/aux-pose signal."""
-        self._inject_camera(cam_k, cam_v, n)
+        self._inject_camera(cam_k, cam_v, n, cam_frame_indices)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pose_list = self.model.camera_head(agg_tokens, causal_inference=True,
                                                num_frame_per_block=1, num_frame_for_scale=self.num_scale)
@@ -526,9 +588,18 @@ class LingBotStream(nn.Module):
         return_multilayer, also returns (cur_agg, patch_start_idx) for the depth head.
         """
         W = self.window
-        n_hist = (k - W + 1) - self.num_scale     # frames [num_scale .. k-W] kept as specials
-        self._inject(cache["scale_k"], cache["scale_v"], cache["anchor_k"], cache["anchor_v"],
-                     n_hist=max(0, n_hist), total_frames=k - W + 1)
+        raw_start = k - W + 1
+        anchor_indices = cache.get("anchor_frame_indices")
+        if anchor_indices is None:
+            self._inject(
+                cache["scale_k"], cache["scale_v"], cache["anchor_k"], cache["anchor_v"],
+                n_hist=max(0, raw_start - self.num_scale), total_frames=raw_start,
+            )
+        else:
+            self._inject(
+                cache["scale_k"], cache["scale_v"], cache["anchor_k"], cache["anchor_v"],
+                anchor_frame_indices=anchor_indices, raw_start=raw_start,
+            )
         outs = []
         with torch.autocast("cuda", dtype=torch.bfloat16):
             for j in range(W):
@@ -561,6 +632,30 @@ class LingBotStream(nn.Module):
     # BATCHED window-forward: run G independent streams on the batch dim
     # ------------------------------------------------------------------ #
     @torch.no_grad()
+    def _batched_hist_and_start(self, caches, raw_starts):
+        """Per-sample (n_hist, temporal f_start) for a batched injection.
+
+        Dense legacy caches: cache row i is frame i+num_scale, so n_hist is the
+        raw prefix length and the RoPE offset is the raw start frame.  Versioned
+        sparse caches: only keyframe rows exist, so n_hist counts keyframes
+        before the raw start (searchsorted) and — because the aggregator's
+        temporal counter advances only on appends — the RoPE offset is the
+        COMPRESSED time num_scale + n_hist, mirroring :meth:`_inject`.
+        """
+        S = self.num_scale
+        n_hist, f_start = [], []
+        for cache, raw_start in zip(caches, raw_starts):
+            indices = cache.get("anchor_frame_indices")
+            if indices is None:
+                n = max(0, int(raw_start) - S)
+                f = int(raw_start)
+            else:
+                n = self._prefix_count(indices, int(raw_start))
+                f = S + n
+            n_hist.append(n)
+            f_start.append(f)
+        return n_hist, f_start
+
     def _inject_batched(self, caches, n_hist_list, f_start_list):
         """Inject G independent per-sample caches stacked on the batch dim, so a
         single streaming pass advances all G streams at once.
@@ -627,8 +722,9 @@ class LingBotStream(nn.Module):
         """
         W, S = self.window, self.num_scale
         G = len(caches)
-        n_hist = [(int(ks[b]) - W + 1) - S for b in range(G)]
-        f_start = [int(ks[b]) - W + 1 for b in range(G)]
+        n_hist, f_start = self._batched_hist_and_start(
+            caches, [int(ks[b]) - W + 1 for b in range(G)]
+        )
         self._inject_batched(caches, n_hist, f_start)
         window_imgs = window_imgs.to(self.device)
         cur_agg = psi = None
@@ -674,8 +770,8 @@ class LingBotStream(nn.Module):
         Ls = [int(ms[b]) - starts[b] + 1 for b in range(G)]
         assert len(set(Ls)) == 1, f"goal_append_warm_batched needs a lockstep group, got L={Ls}"
         L = Ls[0]
-        n_hist = [starts[b] - S for b in range(G)]
-        self._inject_batched(caches, n_hist, starts)
+        n_hist, f_start = self._batched_hist_and_start(caches, starts)
+        self._inject_batched(caches, n_hist, f_start)
 
         # per-sample warm frames [start_b .. m_b] (L each), stacked on the batch dim
         warm_imgs = torch.stack([
@@ -752,9 +848,14 @@ class LingBotStream(nn.Module):
 
     @torch.no_grad()
     def goal_append_warm(self, goal_img, cache, m, rgb_dir, warm, return_agg=False):
-        """Like goal_append's revisit path, but recomputes a DEEP warm-up window
+        """Like goal_append's revisit path, but optionally recomputes a warm-up window
         ``[max(num_scale, m-warm+1) .. m]`` instead of just the nominal ``self.window``
         frames, before streaming the goal at ``m+1``.
+
+        ``warm=0`` is the exact sparse-stream control: inject every cached
+        keyframe through raw frame ``m`` and append the goal without adding a
+        dense local replay.  Positive values implement the hybrid global-sparse /
+        local-dense memory used by MemNav.
 
         window_forward's cold start at the nominal window boundary starves the goal's pose
         estimate — the first live-recomputed frame (and everything causally downstream of
@@ -766,17 +867,31 @@ class LingBotStream(nn.Module):
         ``warm=128`` buys nothing further. Cost is fixed at `warm` frames regardless of how
         deep `m` is, unlike replaying the whole trajectory.
         """
-        start = max(self.num_scale, m - warm + 1)
-        n_hist = start - self.num_scale
-        self._inject(cache["scale_k"], cache["scale_v"], cache["anchor_k"], cache["anchor_v"],
-                    n_hist=n_hist, total_frames=start)
-        imgs = self.load_images([os.path.join(rgb_dir, f"{i}.jpg") for i in range(start, m + 1)])
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            for j in range(len(imgs)):
-                self.model._aggregate_features(
-                    imgs[j:j + 1][None].to(self.device),
-                    num_frame_for_scale=self.num_scale, num_frame_per_block=1,
-                )
+        warm = int(warm)
+        if warm < 0:
+            raise ValueError(f"goal warm-up must be non-negative, got {warm}")
+        start = m + 1 if warm == 0 else max(self.num_scale, m - warm + 1)
+        anchor_indices = cache.get("anchor_frame_indices")
+        if anchor_indices is None:
+            self._inject(
+                cache["scale_k"], cache["scale_v"], cache["anchor_k"], cache["anchor_v"],
+                n_hist=start - self.num_scale, total_frames=start,
+            )
+        else:
+            self._inject(
+                cache["scale_k"], cache["scale_v"], cache["anchor_k"], cache["anchor_v"],
+                anchor_frame_indices=anchor_indices, raw_start=start,
+            )
+        if warm:
+            imgs = self.load_images(
+                [os.path.join(rgb_dir, f"{i}.jpg") for i in range(start, m + 1)]
+            )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                for j in range(len(imgs)):
+                    self.model._aggregate_features(
+                        imgs[j:j + 1][None].to(self.device),
+                        num_frame_for_scale=self.num_scale, num_frame_per_block=1,
+                    )
         return self._stream_one(goal_img, return_agg=return_agg)   # goal at time m+1
 
     # ------------------------------------------------------------------ #

@@ -23,7 +23,9 @@ import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from transformers import PretrainedConfig, PreTrainedModel
 
-from internnav.model.basemodel.memnav.lingbot_stream import LingBotStream, ground_scale_from_h_est
+from internnav.model.basemodel.memnav.cache_schema import validate_cache_pair
+from internnav.model.basemodel.memnav.lingbot_stream import (
+    LingBotStream, ground_scale_from_h_est, GROUND_SCALE_RANGE)
 from internnav.model.encoder.navdp_backbone import (
     LearnablePositionalEncoding,
     NavDP_ImageGoal_Backbone,
@@ -263,8 +265,14 @@ class MemNavNet(nn.Module):
     def __init__(self, lingbot_kwargs=None, dino_dim=1024, lingbot_dim=2048, depth_feat_dim=256,
                  token_dim=384, heads=8, m_rgbd=4, m_depth=4, m_revisit=4, m_novel=4,
                  predict_size=24, temporal_depth=8, num_diffusion_iters=10, goal_warm=64,
-                 aux_pose_calibration='empirical', scale_mode='ground', device="cuda"):
+                 aux_pose_calibration='empirical', scale_mode='ground', ground_scale_max=None,
+                 require_versioned_cache=False, device="cuda"):
         super().__init__()
+        # ground-scale gate ceiling (scale_mode='ground'): corrected estimates above this
+        # fall back to the pooled constant. None -> module default GROUND_SCALE_RANGE[1].
+        self.ground_scale_range = (GROUND_SCALE_RANGE[0],
+                                   float(ground_scale_max) if ground_scale_max is not None
+                                   else GROUND_SCALE_RANGE[1])
         self.lingbot = LingBotStream(device=device, **(lingbot_kwargs or {}))
         self.window = self.lingbot.window
         self.num_scale = self.lingbot.num_scale
@@ -275,6 +283,10 @@ class MemNavNet(nn.Module):
         # `window` on purpose (see LingBotStream.goal_append_warm); validated against a
         # continuous-stream oracle in scripts/diag_lingbot_pose_accuracy.py.
         self.goal_warm = goal_warm
+        # Sparse-cache training must fail closed on a legacy/mixed cache tree
+        # (silently shifted temporal indices otherwise); dense-cache training
+        # keeps the permissive default.
+        self.require_versioned_cache = bool(require_versioned_cache)
 
         # trainable heads
         self.retrieval = RetrievalHead(dino_dim=dino_dim)
@@ -394,8 +406,21 @@ class MemNavNet(nn.Module):
         ``scale_k/scale_v`` (--skip_scale precompute mode), compute it on the
         fly from the first ``num_scale`` RGB frames of ``rgb_dir`` — bf16 output,
         LRU-cached per trajectory inside LingBotStream."""
-        c = np.load(path)
-        keys = set(c.files)
+        with np.load(path) as c_file, np.load(
+            path.replace("lingbot_cache.npz", "lingbot_cam_cache.npz")
+        ) as cc_file:
+            # Materialize once: validation and GPU conversion otherwise cause
+            # np.load to reread the large ZIP_STORED KV arrays independently.
+            c = {name: c_file[name] for name in c_file.files}
+            cc = {name: cc_file[name] for name in cc_file.files}
+        # Two-timeline layout check: which raw frames the sparse KV rows cover
+        # (legacy dense caches validate as interval-1 with full coverage).
+        layout = validate_cache_pair(
+            c, cc,
+            expected_num_scale_frames=self.num_scale,
+            require_versioned=self.require_versioned_cache,
+        )
+        keys = set(c)
         if "scale_k" in keys and "scale_v" in keys:
             sk, sv, ak, av = LingBotStream._cache_to_layered(
                 c["scale_k"], c["scale_v"], c["anchor_k"], c["anchor_v"], self.device)
@@ -405,7 +430,6 @@ class MemNavNet(nn.Module):
                 .permute(1, 2, 0, 3, 4).contiguous()
             av = torch.as_tensor(c["anchor_v"], device=self.device, dtype=torch.bfloat16)\
                 .permute(1, 2, 0, 3, 4).contiguous()
-        cc = np.load(path.replace("lingbot_cache.npz", "lingbot_cam_cache.npz"))
         ck, cv = LingBotStream._cam_to_device(cc["cam_k"], cc["cam_v"], self.device)
         # cam_pose_enc [S,9]: the frozen camera head's own pose for every REAL trajectory
         # frame, captured during precompute's genuinely continuous stream (extract_trajectory)
@@ -418,10 +442,21 @@ class MemNavNet(nn.Module):
         # whole-episode ground-anchored floor estimate stored by precompute
         # (--skip_ground_scale omits it; NaN = stream saw no confident floor).
         # None -> encode_memory falls back to the on-the-fly 64-frame estimate.
-        ghe = float(cc["ground_h_est"]) if "ground_h_est" in cc.files else float("nan")
-        return dict(scale_k=sk, scale_v=sv, anchor_k=ak, anchor_v=av, cam_k=ck, cam_v=cv,
+        ghe = float(cc["ground_h_est"]) if "ground_h_est" in cc else float("nan")
+        out = dict(scale_k=sk, scale_v=sv, anchor_k=ak, anchor_v=av, cam_k=ck, cam_v=cv,
                    cam_pose_enc=cam_pose_enc,
                    ground_h_est=ghe if np.isfinite(ghe) else None)
+        if not layout.legacy_dense:
+            # Sparse keyframe caches: raw-frame indices of the surviving KV rows.
+            # LingBotStream's injection uses these to translate "history up to raw
+            # frame k" into row counts + compressed aggregator time; the camera
+            # head keeps raw times. Legacy dense caches omit them and take the
+            # original row==frame arithmetic unchanged.
+            out["anchor_frame_indices"] = torch.as_tensor(
+                layout.anchor_frame_indices, dtype=torch.long)
+            out["cam_frame_indices"] = torch.as_tensor(
+                layout.cam_frame_indices, dtype=torch.long)
+        return out
 
     def encode_memory(self, batch):
         """Frozen front-end orchestration. Retrieval (trainable, batched) picks the
@@ -501,11 +536,14 @@ class MemNavNet(nn.Module):
                         # the whole-episode ground_h_est stored in the cam cache by
                         # precompute (zero runtime cost). Fallback for old caches: the
                         # on-the-fly 64-frame estimate (cached by rgb_dir, ~2s once per
-                        # trajectory). Either way None -> pooled-constant fallback.
+                        # trajectory). ground_scale_from_h_est now CLAMPS to
+                        # self.ground_scale_range, so s is None only when the estimate is
+                        # genuinely invalid (no confident floor) -> pooled-constant fallback.
                         ch = batch.get("batch_camera_height")
                         cam_h = float(ch[b]) if ch is not None else 0.5
                         if caches[jj]["ground_h_est"] is not None:
-                            s = ground_scale_from_h_est(caches[jj]["ground_h_est"], cam_h)
+                            s = ground_scale_from_h_est(caches[jj]["ground_h_est"], cam_h,
+                                                        scale_range=self.ground_scale_range)
                         else:
                             s = self.lingbot.get_metric_scale(
                                 batch["rgb_dirs"][b], caches[jj]["cam_pose_enc"], cam_h)
@@ -532,7 +570,8 @@ class MemNavNet(nn.Module):
                         _, goal_agg = self.lingbot.goal_append_warm(goal_img, cache, m_of[b],
                                                                     batch["rgb_dirs"][b], warm, return_agg=True)
                         goalp[b] = self.lingbot.camera_pose(cache["cam_k"], cache["cam_v"],
-                                                            m_of[b] + 1, goal_agg)[-1]
+                                                            m_of[b] + 1, goal_agg,
+                                                            cam_frame_indices=cache.get("cam_frame_indices"))[-1]
                     else:
                         gc = [caches[jj] for jj, b in members]
                         gms = [m_of[b] for jj, b in members]
@@ -541,7 +580,8 @@ class MemNavNet(nn.Module):
                         _, aggs = self.lingbot.goal_append_warm_batched(ggoal, gc, gms, grgb, warm, return_agg=True)
                         for (jj, b), agg in zip(members, aggs):
                             goalp[b] = self.lingbot.camera_pose(caches[jj]["cam_k"], caches[jj]["cam_v"],
-                                                                m_of[b] + 1, agg)[-1]  # [9] goal abs pose
+                                                                m_of[b] + 1, agg,
+                                                                cam_frame_indices=caches[jj].get("cam_frame_indices"))[-1]  # [9] goal abs pose
 
         return dict(
             current=torch.stack(cur_t),      # [B, P, 2C]    post-GCT (RGBD branch)
@@ -609,6 +649,8 @@ class MemNavPolicy(PreTrainedModel):
             goal_warm=il.get('goal_warm', 64),
             aux_pose_calibration=il.get('aux_pose_calibration', 'empirical'),
             scale_mode=il.get('scale_mode', 'ground'),
+            require_versioned_cache=bool(il.get('require_versioned_cache', False)),
+            ground_scale_max=il.get('ground_scale_max'),
             lingbot_kwargs=lingbot_kwargs or None, device=str(self._device),
         )
 

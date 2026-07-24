@@ -22,11 +22,16 @@ _LINGBOT_WEIGHTS = os.environ.get(
 # Frames may live in a read-only squashfs overlay (mp3d pt1.sqf) while caches are
 # written to a SEPARATE writable tree — MEMNAV_FEATURE_ROOT points at that tree
 # (None = old behavior: cache sits beside the frames). window/num_scale/max_frame_num
-# MUST match how the caches were precomputed (mp3d: window=32, num_scale=8, mfn=2048).
+# MUST match how the caches were precomputed (mp3d: window=32, num_scale=8, mfn=4096).
 _FEATURE_ROOT = os.environ.get('MEMNAV_FEATURE_ROOT') or None
 _WINDOW_SIZE = int(os.environ.get('MEMNAV_WINDOW', '32'))
 _NUM_SCALE = int(os.environ.get('MEMNAV_NUM_SCALE', '8'))
-_MAX_FRAME_NUM = int(os.environ.get('MEMNAV_MAX_FRAME_NUM', '2048'))
+_MAX_FRAME_NUM = int(os.environ.get('MEMNAV_MAX_FRAME_NUM', '4096'))
+# Fail closed on legacy/mixed cache trees when training on versioned sparse caches
+# (keyframe-subsampled KV memory). Off by default so dense-cache runs are unchanged.
+_REQUIRE_VERSIONED_CACHE = os.environ.get(
+    'MEMNAV_REQUIRE_VERSIONED_CACHE', ''
+).lower() in ('1', 'true', 'yes')
 # Restrict to episodes with n_legs <= MEMNAV_MAX_LEGS (unset or 0 = keep all; 2 = two-leg only).
 _MAX_LEGS = int(os.environ.get('MEMNAV_MAX_LEGS') or 0) or None
 # Step-based checkpointing: save every N optimizer steps so a wall-clock timeout banks
@@ -39,6 +44,11 @@ _SAVE_STEPS = int(os.environ.get('MEMNAV_SAVE_STEPS', '100'))
 # upstream camera poses are frozen). Both remain a per-video-scale-ambiguity-limited
 # diagnostic, not a precision signal -- see the ground-anchored-scale TODO there.
 _AUX_POSE_CALIBRATION = os.environ.get('MEMNAV_AUX_POSE_CALIBRATION', 'empirical')
+# ground-scale clamp ceiling (scale_mode='ground'): corrected per-episode estimates above
+# this are CLAMPED to it (not discarded). Default 6.0 leaves ~95.6% of pt1 episodes
+# untouched; the ~4% above clamp to 6.0 (beats the old reject-to-constant in every band)
+# — see lingbot_stream.GROUND_SCALE_RANGE / diag_ground_scale_sweep.py.
+_GROUND_SCALE_MAX = float(os.environ.get('MEMNAV_GROUND_SCALE_MAX', '6.0'))
 
 memnav_exp_cfg = ExpCfg(
     name='memnav_train',
@@ -99,6 +109,9 @@ memnav_exp_cfg = ExpCfg(
         # recompute, which measured the same accuracy as never evicting at all.
         goal_warm=64,
         aux_pose_calibration=_AUX_POSE_CALIBRATION,
+        require_versioned_cache=_REQUIRE_VERSIONED_CACHE,
+        # ground-scale gate ceiling (MEMNAV_GROUND_SCALE_MAX; scale_mode='ground')
+        ground_scale_max=_GROUND_SCALE_MAX,
         # policy / diffusion
         predict_size=24,
         temporal_depth=8,
